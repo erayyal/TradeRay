@@ -85,8 +85,33 @@ def _market_job_id(market: MarketType) -> str:
 # Job bodies
 # ---------------------------------------------------------------------------
 
+async def _is_system_enabled() -> bool:
+    """Master switch — `config:system_enabled` Redis flag.
+
+    Default is OFF (False). The dashboard's master toggle writes "1" or "0".
+    When OFF, every market_cycle_job early-returns: no data fetch, no LLM
+    calls, no orders. Tracker jobs (Binance reconciliation, signal
+    resolution, stale-order TTL) are NOT gated — they still need to run to
+    resolve in-flight trades even if the user paused new decision-making.
+    """
+    try:
+        from core.redis_client import cache
+        val = await cache.client.get("config:system_enabled")
+        return val == "1"
+    except Exception as e:
+        # Fail-safe: if Redis is unreachable, stay paused rather than
+        # silently spending tokens.
+        log.warning("scheduler.system_flag_read_failed", err=str(e))
+        return False
+
+
 async def _market_cycle_job(market_value: str) -> None:
     """Re-read MarketConfig fresh on every tick so UI edits propagate."""
+    # Master switch — gate every market cycle behind a single Redis flag.
+    if not await _is_system_enabled():
+        log.info("scheduler.system_paused", market=market_value)
+        return
+
     try:
         market = MarketType(market_value)
     except ValueError:

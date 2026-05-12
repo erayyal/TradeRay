@@ -244,6 +244,23 @@ async def _aset_screener_flag(market: str, value: bool) -> None:
         await r.aclose()
 
 
+async def _aread_system_enabled() -> bool:
+    """Master switch state — `config:system_enabled` Redis key. False default."""
+    r = redis_asyncio.from_url(settings.redis_url, decode_responses=True)
+    try:
+        return (await r.get("config:system_enabled")) == "1"
+    finally:
+        await r.aclose()
+
+
+async def _awrite_system_enabled(value: bool) -> None:
+    r = redis_asyncio.from_url(settings.redis_url, decode_responses=True)
+    try:
+        await r.set("config:system_enabled", "1" if value else "0")
+    finally:
+        await r.aclose()
+
+
 # -- Streamlit cache wrappers ------------------------------------------------
 
 @st.cache_data(ttl=10)
@@ -269,6 +286,12 @@ def load_cost_logs(days_back: int = 7) -> list[dict[str, Any]]:
 @st.cache_data(ttl=10)
 def load_redis_state() -> dict[str, Any]:
     return _run_async(_aload_redis_state())
+
+
+@st.cache_data(ttl=5)
+def load_system_enabled() -> bool:
+    """Cached read of the master switch (5s TTL — propagation matters)."""
+    return _run_async(_aread_system_enabled())
 
 
 # ============================================================================
@@ -435,6 +458,34 @@ def render_sidebar(configs: list[dict[str, Any]], screener_flags: dict[str, bool
         f"Model: `{settings.anthropic_model}` · "
         f"Binance **{'Testnet' if settings.binance_testnet else 'LIVE'}**"
     )
+
+    # -------- MASTER SWITCH --------
+    # When OFF (default), the scheduler skips every market cycle — no LLM
+    # calls, no orders, no token spend. Tracker jobs still run to resolve
+    # in-flight trades, but no new decisions are made.
+    system_enabled = load_system_enabled()
+    status_emoji = "🟢" if system_enabled else "🔴"
+    status_word = "RUNNING" if system_enabled else "PAUSED"
+    st.sidebar.markdown(f"### {status_emoji} System: **{status_word}**")
+    new_state = st.sidebar.toggle(
+        "Enable bot (master switch)",
+        value=system_enabled,
+        key="master_switch",
+        help=(
+            "When OFF, every market cycle is skipped. No LLM calls, no orders, "
+            "no token spend. Tracker still reconciles open positions."
+        ),
+    )
+    if new_state != system_enabled:
+        _run_async(_awrite_system_enabled(new_state))
+        st.cache_data.clear()
+        st.success(
+            "✅ Bot RESUMED — cycles will fire on next tick."
+            if new_state else
+            "⏸ Bot PAUSED — no new cycles will run."
+        )
+        st.rerun()
+    st.sidebar.markdown("---")
 
     cfg_by_market = {c["market"]: c for c in configs}
 
