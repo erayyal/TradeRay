@@ -48,7 +48,7 @@ TA-Lib>=0.4.32
 
 # --- Vision (chart rendering for Master Trader) ---
 matplotlib>=3.8
-mplfinance>=0.12.10
+mplfinance>=0.12.10b0
 
 # --- UI ---
 streamlit>=1.39
