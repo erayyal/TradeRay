@@ -11,6 +11,25 @@
 # no risk of port conflicts, key collisions, or DNS hijacking.
 
 services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: traderay-postgres
+    restart: unless-stopped
+    networks:
+      - traderay_net
+    environment:
+      POSTGRES_USER: traderay
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-traderay_local_dev_pw}
+      POSTGRES_DB: traderay
+    volumes:
+      - traderay-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U traderay -d traderay"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    # No host port — only reachable from inside traderay_net.
+
   redis:
     image: redis:7-alpine
     container_name: traderay-redis
@@ -41,13 +60,17 @@ services:
       # Override the .env REDIS_URL with the docker-network DNS name.
       # Inside this network, `redis` resolves to the redis service above.
       REDIS_URL: redis://redis:6379/0
-      # Ensure Python uses UTC consistently (logs + DB timestamps)
+      # Local Postgres container — no Supabase pooler quirks. Username +
+      # password match the `postgres` service environment above.
+      DATABASE_URL: postgresql+asyncpg://traderay:${POSTGRES_PASSWORD:-traderay_local_dev_pw}@postgres:5432/traderay
       TZ: UTC
       PYTHONUNBUFFERED: "1"
     networks:
       - traderay_net
     depends_on:
       redis:
+        condition: service_healthy
+      postgres:
         condition: service_healthy
     command: ["python", "main.py"]
     healthcheck:
@@ -65,12 +88,15 @@ services:
     env_file: .env
     environment:
       REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql+asyncpg://traderay:${POSTGRES_PASSWORD:-traderay_local_dev_pw}@postgres:5432/traderay
       TZ: UTC
       PYTHONUNBUFFERED: "1"
     networks:
       - traderay_net
     depends_on:
       redis:
+        condition: service_healthy
+      postgres:
         condition: service_healthy
       backend:
         condition: service_started
@@ -113,3 +139,5 @@ networks:
 volumes:
   traderay-redis-data:
     name: traderay-redis-data
+  traderay-postgres-data:
+    name: traderay-postgres-data
