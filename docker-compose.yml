@@ -91,6 +91,9 @@ services:
       DATABASE_URL: postgresql+asyncpg://traderay:${POSTGRES_PASSWORD:-traderay_local_dev_pw}@postgres:5432/traderay
       TZ: UTC
       PYTHONUNBUFFERED: "1"
+      # Streamlit only adds the script's directory (/app/ui) to sys.path —
+      # set PYTHONPATH so `from config import settings` (a sibling dir) works.
+      PYTHONPATH: "/app"
     networks:
       - traderay_net
     depends_on:

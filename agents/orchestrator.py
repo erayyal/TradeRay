@@ -566,8 +566,29 @@ async def _resolve_symbols(market_config: MarketConfig) -> list[str]:
     return picks
 
 
+async def _is_system_enabled() -> bool:
+    """Master switch — `config:system_enabled` Redis flag. Default OFF.
+
+    Gated INSIDE `run_market_cycle` so every entry point respects it
+    (scheduler ticks, the boot-time kickstart, future admin tools, tests).
+    """
+    try:
+        val = await cache.client.get("config:system_enabled")
+        return val == "1"
+    except Exception as e:
+        log.warning("orchestrator.system_flag_read_failed", err=str(e))
+        return False  # Fail-safe: stay paused if Redis is unreachable.
+
+
 async def run_market_cycle(market_config: MarketConfig) -> None:
     """Run a full cycle for one market, iterating its configured symbols."""
+    # Master switch — covers BOTH scheduler ticks AND the boot kickstart.
+    if not await _is_system_enabled():
+        log.info(
+            "orchestrator.system_paused", market=market_config.market.value
+        )
+        return
+
     if not market_config.enabled:
         log.info("orchestrator.market_disabled", market=market_config.market.value)
         return
