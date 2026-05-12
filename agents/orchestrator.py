@@ -276,7 +276,7 @@ async def _run_sentiment(
     parsed, usage = await call_agent(
         system_prompt=SENTIMENT_SYSTEM_PROMPT,
         user_content=json.dumps(macro_context, default=str),
-        max_tokens=2000,
+        max_tokens=3500,
         label=f"sentiment:{symbol}",
     )
     await _log_llm_cost(
