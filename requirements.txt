@@ -1,0 +1,57 @@
+# ============================================================================
+# TradeRay — Python dependencies
+#
+# System prerequisite (TA-Lib): the TA-Lib Python wrapper requires the native
+# C library to be installed first.
+#   macOS  : brew install ta-lib
+#   Linux  : apt-get install -y libta-lib0 libta-lib0-dev
+#           or build from https://github.com/TA-Lib/ta-lib (0.4+)
+# ============================================================================
+
+# --- Configuration / settings ---
+python-dotenv>=1.0
+pydantic>=2.9
+pydantic-settings>=2.6
+
+# --- ORM (async SQLAlchemy 2.0) ---
+SQLAlchemy>=2.0
+greenlet>=3.0          # SQLAlchemy async dialect requires greenlet at runtime
+aiosqlite>=0.20        # SQLite async driver (default backend)
+asyncpg>=0.29          # PostgreSQL async driver (Supabase / production backend)
+
+# --- LLM (Anthropic Messages API + retry) ---
+anthropic>=0.92.0
+tenacity>=8.2
+
+# --- Async HTTP (RSS news, FRED, DefiLlama, Telegram) ---
+aiohttp>=3.10
+
+# --- RSS news aggregator (replaces deprecated CryptoPanic Developer API) ---
+feedparser>=6.0
+
+# --- Background scheduler ---
+APScheduler>=3.10
+
+# --- State / cache ---
+redis[hiredis]>=5.1
+
+# --- Exchange ---
+python-binance>=1.0.22
+
+# --- Traditional markets ---
+yfinance>=0.2.40
+
+# --- Numeric / TA ---
+pandas>=2.2
+numpy>=1.26
+TA-Lib>=0.4.32
+
+# --- Vision (chart rendering for Master Trader) ---
+matplotlib>=3.8
+mplfinance>=0.12.10
+
+# --- UI ---
+streamlit>=1.39
+
+# --- Structured logging ---
+structlog>=24.4

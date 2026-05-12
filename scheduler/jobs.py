@@ -1,0 +1,395 @@
+"""APScheduler wiring driven by the MarketConfig table + tracker maintenance jobs.
+
+Two job families:
+
+  1. Market-cycle jobs  — one per enabled market, fired at the cadence
+     implied by its Term:
+         SCALP       → every 5  minutes
+         SHORT_TERM  → every 1  hour
+         MID_TERM    → every 24 hours
+     Each tick re-reads MarketConfig from the DB so UI edits to enabled,
+     term, execution_mode, or symbols_csv take effect on the next tick
+     without a process restart.
+
+  2. Tracker maintenance jobs — three globally-scheduled jobs that run
+     every 5 minutes regardless of market state:
+         tracker:binance_orders     → reconcile Trade rows with Binance
+                                       (entry fills, SL/TP hits, realized PnL)
+         tracker:signal_resolution  → replay candles and resolve theoretical
+                                       PnL for non-WAIT signals
+         tracker:stale_orders       → cancel any unfilled Limit Order older
+                                       than 24h (Layer 1 of staleness mgr;
+                                       Layer 2 is AI-driven CANCEL_PENDING
+                                       inside the orchestrator)
+
+Job-level safety: max_instances=1, coalesce=True, misfire_grace_time=60.
+"""
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
+from sqlalchemy import select
+
+from agents.orchestrator import run_market_cycle
+from core.logger import get_logger
+from core.telegram_notifier import (
+    is_configured as telegram_is_configured,
+    notify_daily_digest,
+)
+from execution.tracker import (
+    manage_stale_orders,
+    sync_binance_orders,
+    sync_theoretical_signals,
+)
+from models import (
+    AsyncSessionLocal,
+    MarketConfig,
+    MarketType,
+    Signal,
+    SignalAction,
+    Term,
+    Trade,
+    TradeStatus,
+)
+
+log = get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Term → tick interval (seconds) for market-cycle jobs.
+# ---------------------------------------------------------------------------
+
+TERM_INTERVAL_SECONDS: dict[Term, int] = {
+    Term.SCALP: 5 * 60,
+    Term.SHORT_TERM: 60 * 60,
+    Term.MID_TERM: 24 * 60 * 60,
+}
+
+# Tracker jobs all run on the same 5-minute heartbeat. Cheap, and frequent
+# enough that the UI's PnL numbers + active-order list stay current.
+TRACKER_INTERVAL_SECONDS: int = 5 * 60
+
+_MARKET_JOB_PREFIX = "market_cycle:"
+_TRACKER_JOB_PREFIX = "tracker:"
+
+
+def _market_job_id(market: MarketType) -> str:
+    return f"{_MARKET_JOB_PREFIX}{market.value}"
+
+
+# ---------------------------------------------------------------------------
+# Job bodies
+# ---------------------------------------------------------------------------
+
+async def _market_cycle_job(market_value: str) -> None:
+    """Re-read MarketConfig fresh on every tick so UI edits propagate."""
+    try:
+        market = MarketType(market_value)
+    except ValueError:
+        log.warning("scheduler.invalid_market", market=market_value)
+        return
+
+    async with AsyncSessionLocal() as session:
+        cfg = (
+            await session.execute(
+                select(MarketConfig).where(MarketConfig.market == market)
+            )
+        ).scalar_one_or_none()
+
+    if cfg is None:
+        log.warning("scheduler.config_missing", market=market_value)
+        return
+    if not cfg.enabled:
+        log.info("scheduler.skipped_disabled", market=market_value)
+        return
+
+    try:
+        await run_market_cycle(cfg)
+    except Exception as e:
+        log.exception("scheduler.cycle_crashed", market=market_value, err=str(e))
+
+
+# Tracker job wrappers — each catches its own exceptions so a single bad
+# trade reconciliation can't take down the whole tracker.
+
+async def _tracker_sync_binance_orders_job() -> None:
+    try:
+        result = await sync_binance_orders()
+        log.info("scheduler.tracker.binance_done", **(result or {}))
+    except Exception as e:
+        log.exception("scheduler.tracker.binance_crashed", err=str(e))
+
+
+async def _tracker_sync_signals_job() -> None:
+    try:
+        result = await sync_theoretical_signals()
+        log.info("scheduler.tracker.signals_done", **(result or {}))
+    except Exception as e:
+        log.exception("scheduler.tracker.signals_crashed", err=str(e))
+
+
+async def _tracker_stale_orders_job() -> None:
+    try:
+        result = await manage_stale_orders()
+        log.info("scheduler.tracker.stale_done", **(result or {}))
+    except Exception as e:
+        log.exception("scheduler.tracker.stale_crashed", err=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def build_scheduler() -> AsyncIOScheduler:
+    return AsyncIOScheduler(timezone="UTC")
+
+
+async def configure_jobs(scheduler: AsyncIOScheduler) -> None:
+    """Register all jobs: per-market cycle jobs + the three tracker jobs.
+
+    Idempotent — safe to call repeatedly (`reload_jobs` does exactly that).
+    """
+    # ---- 1. Market-cycle jobs (per MarketConfig row) ------------------------
+    async with AsyncSessionLocal() as session:
+        configs = (await session.execute(select(MarketConfig))).scalars().all()
+
+    expected_market_ids: set[str] = set()
+    for cfg in configs:
+        jid = _market_job_id(cfg.market)
+        expected_market_ids.add(jid)
+
+        if not cfg.enabled:
+            if scheduler.get_job(jid):
+                scheduler.remove_job(jid)
+                log.info("scheduler.job_disabled", job_id=jid)
+            continue
+
+        seconds = TERM_INTERVAL_SECONDS[cfg.term]
+        scheduler.add_job(
+            _market_cycle_job,
+            trigger=IntervalTrigger(seconds=seconds),
+            args=[cfg.market.value],
+            id=jid,
+            name=f"{cfg.market.value} ({cfg.term.value})",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=60,
+        )
+        log.info(
+            "scheduler.job_scheduled",
+            job_id=jid,
+            market=cfg.market.value,
+            term=cfg.term.value,
+            interval_seconds=seconds,
+            execution_mode=cfg.execution_mode.value,
+            symbols=cfg.symbols,
+        )
+
+    # Sweep orphaned market-cycle jobs (rows that disappeared)
+    for job in list(scheduler.get_jobs()):
+        if (
+            job.id.startswith(_MARKET_JOB_PREFIX)
+            and job.id not in expected_market_ids
+        ):
+            scheduler.remove_job(job.id)
+            log.info("scheduler.job_orphan_removed", job_id=job.id)
+
+    # ---- 2. Tracker maintenance jobs (always-on, 5min) ----------------------
+    _configure_tracker_jobs(scheduler)
+
+    # ---- 3. Daily Telegram digest (midnight UTC) ----------------------------
+    _configure_digest_job(scheduler)
+
+
+def _configure_tracker_jobs(scheduler: AsyncIOScheduler) -> None:
+    """Register the three tracker jobs.
+
+    Each runs every 5 minutes. They're independent of MarketConfig — even
+    if every market is disabled, we still need to reconcile in-flight trades
+    and resolve historical signals.
+    """
+    common = {
+        "trigger": IntervalTrigger(seconds=TRACKER_INTERVAL_SECONDS),
+        "max_instances": 1,
+        "coalesce": True,
+        "misfire_grace_time": 60,
+        "replace_existing": True,
+    }
+
+    scheduler.add_job(
+        _tracker_sync_binance_orders_job,
+        id=f"{_TRACKER_JOB_PREFIX}binance_orders",
+        name="Tracker: Binance order reconciliation (entry fills, SL/TP, PnL)",
+        **common,
+    )
+    scheduler.add_job(
+        _tracker_sync_signals_job,
+        id=f"{_TRACKER_JOB_PREFIX}signal_resolution",
+        name="Tracker: theoretical signal resolution (TP/SL replay)",
+        **common,
+    )
+    scheduler.add_job(
+        _tracker_stale_orders_job,
+        id=f"{_TRACKER_JOB_PREFIX}stale_orders",
+        name="Tracker: stale Limit Order TTL cancellation (24h)",
+        **common,
+    )
+
+    log.info(
+        "scheduler.tracker_jobs_scheduled",
+        interval_seconds=TRACKER_INTERVAL_SECONDS,
+        jobs=[
+            f"{_TRACKER_JOB_PREFIX}binance_orders",
+            f"{_TRACKER_JOB_PREFIX}signal_resolution",
+            f"{_TRACKER_JOB_PREFIX}stale_orders",
+        ],
+    )
+
+
+async def reload_jobs(scheduler: AsyncIOScheduler) -> None:
+    """Hook for the dashboard / admin endpoints after MarketConfig edits."""
+    await configure_jobs(scheduler)
+    log.info("scheduler.reloaded", n_jobs=len(scheduler.get_jobs()))
+
+
+# ---------------------------------------------------------------------------
+# Daily digest job (midnight UTC) — Telegram summary of the day that ended
+# ---------------------------------------------------------------------------
+
+_DIGEST_JOB_ID: str = "telegram:daily_digest"
+
+
+async def send_daily_digest() -> None:
+    """Compute the previous 24h performance and ship a Telegram summary.
+
+    Window: [start, end) where end = today 00:00 UTC, start = yesterday 00:00.
+    The header therefore reports on "yesterday" — the day that just ended.
+
+    Realized PnL = closed Crypto AUTO_BOT trades whose `closed_at` falls in the
+    window. Theoretical PnL = signals whose `raw_payload["resolution"]` was
+    written by the tracker with a `resolved_at` in the window. We scan a
+    30-day signal cohort to catch resolutions of older signals that closed
+    yesterday — the resolution time, not the creation time, is what matters.
+
+    Silently no-ops when Telegram isn't configured.
+    """
+    if not telegram_is_configured():
+        log.debug("scheduler.digest.skipped", reason="telegram_not_configured")
+        return
+
+    now = datetime.now(timezone.utc)
+    end = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+    start = end - timedelta(days=1)
+
+    # ---- Realized Crypto PnL ----------------------------------------------
+    async with AsyncSessionLocal() as session:
+        trades = (
+            await session.execute(
+                select(Trade).where(
+                    Trade.status == TradeStatus.CLOSED,
+                    Trade.closed_at >= start,
+                    Trade.closed_at < end,
+                )
+            )
+        ).scalars().all()
+
+    crypto_pnl = sum((t.realized_pnl_usd or 0.0) for t in trades)
+    crypto_wins = sum(1 for t in trades if (t.realized_pnl_usd or 0) > 0)
+    crypto_losses = len(trades) - crypto_wins
+
+    # ---- Theoretical signal PnL (resolutions inside the window) -----------
+    cohort_floor = start - timedelta(days=30)
+    async with AsyncSessionLocal() as session:
+        signals = (
+            await session.execute(
+                select(Signal).where(
+                    Signal.created_at >= cohort_floor,
+                    Signal.action != SignalAction.WAIT,
+                )
+            )
+        ).scalars().all()
+
+    summary: dict[str, dict[str, Any]] = {}
+    for s in signals:
+        res = (s.raw_payload or {}).get("resolution")
+        if not res:
+            continue
+        resolved_iso = res.get("resolved_at")
+        if not resolved_iso:
+            continue
+        try:
+            resolved_dt = datetime.fromisoformat(
+                str(resolved_iso).replace("Z", "+00:00")
+            )
+        except ValueError:
+            continue
+        if not (start <= resolved_dt < end):
+            continue
+
+        bucket = summary.setdefault(
+            s.market.value,
+            {"n": 0, "pnl": 0.0, "wins": 0, "losses": 0},
+        )
+        bucket["n"] += 1
+        bucket["pnl"] += float(res.get("theoretical_pnl_usd") or 0.0)
+        if res.get("outcome") == "TP":
+            bucket["wins"] += 1
+        else:
+            bucket["losses"] += 1
+
+    await notify_daily_digest(
+        date_str=start.strftime("%Y-%m-%d"),
+        crypto_pnl=crypto_pnl,
+        crypto_wins=crypto_wins,
+        crypto_losses=crypto_losses,
+        crypto_n_trades=len(trades),
+        signal_summary=summary,
+    )
+
+    log.info(
+        "scheduler.digest.sent",
+        date=start.strftime("%Y-%m-%d"),
+        crypto_trades=len(trades),
+        crypto_pnl=round(crypto_pnl, 2),
+        n_markets_with_signals=len(summary),
+    )
+
+
+async def _daily_digest_job_wrapper() -> None:
+    """Outer shield so a digest crash never propagates into APScheduler."""
+    try:
+        await send_daily_digest()
+    except Exception as e:
+        log.exception("scheduler.digest.crashed", err=str(e))
+
+
+def _configure_digest_job(scheduler: AsyncIOScheduler) -> None:
+    """Register the midnight digest job (idempotent via replace_existing)."""
+    scheduler.add_job(
+        _daily_digest_job_wrapper,
+        trigger=CronTrigger(hour=0, minute=0, timezone="UTC"),
+        id=_DIGEST_JOB_ID,
+        name="Telegram: midnight daily digest (UTC)",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        # 10-min grace so a slightly-late tick still fires (instead of skipping
+        # the whole day) but doesn't spam if the process was offline for hours.
+        misfire_grace_time=600,
+    )
+    log.info("scheduler.digest_job_scheduled", job_id=_DIGEST_JOB_ID)
+
+
+__all__ = [
+    "build_scheduler",
+    "configure_jobs",
+    "reload_jobs",
+    "send_daily_digest",
+    "TERM_INTERVAL_SECONDS",
+    "TRACKER_INTERVAL_SECONDS",
+]

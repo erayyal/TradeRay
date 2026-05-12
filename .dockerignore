@@ -1,0 +1,47 @@
+# Secrets — env_file mounts at runtime, NEVER bake into image
+.env
+.env.local
+.env.*.local
+
+# Python build/cache artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtualenvs (always rebuilt inside the image)
+.venv/
+venv/
+env/
+.envrc
+
+# Editor / OS junk
+.idea/
+.vscode/
+.DS_Store
+*.swp
+*~
+
+# Local databases (we use Supabase in production)
+*.db
+*.db-journal
+traderay.db*
+
+# Runtime logs
+logs/
+*.log
+
+# Git
+.git/
+.gitignore
+
+# Documentation never needed at runtime
+README*.md
+docs/

@@ -1,0 +1,99 @@
+# TradeRay v1.0 — production compose
+#
+# Three services on an isolated bridge network:
+#   - traderay-redis    : private cache + decision state (no host port)
+#   - traderay-backend  : python main.py (scheduler + agents + execution)
+#   - traderay-ui       : Streamlit dashboard (host-port bound to 127.0.0.1
+#                         only — reach via SSH tunnel from your laptop)
+#
+# Existing redis_cache / postgres_prod / grafana containers on the host are
+# untouched — TradeRay runs on its own `traderay_net` network so there is
+# no risk of port conflicts, key collisions, or DNS hijacking.
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: traderay-redis
+    restart: unless-stopped
+    networks:
+      - traderay_net
+    volumes:
+      - traderay-redis-data:/data
+    # AOF persistence — Redis state survives container restart.
+    # Without this we'd lose the dynamic_screener flag + cached decisions
+    # every time we `docker compose down`.
+    command: ["redis-server", "--appendonly", "yes", "--save", "60", "1"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    # Deliberately no `ports:` — Redis is only reachable from inside
+    # traderay_net. Other host services (redis_cache) keep their own port.
+
+  backend:
+    build: .
+    image: traderay:latest
+    container_name: traderay-backend
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Override the .env REDIS_URL with the docker-network DNS name.
+      # Inside this network, `redis` resolves to the redis service above.
+      REDIS_URL: redis://redis:6379/0
+      # Ensure Python uses UTC consistently (logs + DB timestamps)
+      TZ: UTC
+      PYTHONUNBUFFERED: "1"
+    networks:
+      - traderay_net
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: ["python", "main.py"]
+    healthcheck:
+      # main.py runs forever; the healthcheck just verifies the process is
+      # actually executing python (not crash-looped). Real health is in logs.
+      test: ["CMD", "pgrep", "-f", "python main.py"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  ui:
+    image: traderay:latest
+    container_name: traderay-ui
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      TZ: UTC
+      PYTHONUNBUFFERED: "1"
+    networks:
+      - traderay_net
+    depends_on:
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_started
+    # 127.0.0.1 binding ON THE HOST — Streamlit is reachable ONLY from
+    # localhost on the server. From your laptop you'll SSH-tunnel to it.
+    # The container itself still binds 0.0.0.0:8501 because docker port
+    # publishing needs that; the host-side bind is what restricts access.
+    ports:
+      - "127.0.0.1:8501:8501"
+    command:
+      - streamlit
+      - run
+      - ui/dashboard.py
+      - --server.port=8501
+      - --server.address=0.0.0.0
+      - --server.headless=true
+      - --browser.gatherUsageStats=false
+
+networks:
+  traderay_net:
+    driver: bridge
+    name: traderay_net
+
+volumes:
+  traderay-redis-data:
+    name: traderay-redis-data
