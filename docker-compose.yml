@@ -89,6 +89,22 @@ services:
       - --server.headless=true
       - --browser.gatherUsageStats=false
 
+  # Cloudflare Tunnel — dials OUT to Cloudflare's edge, no inbound port
+  # exposure on the server. Once the tunnel's Public Hostname is configured
+  # in the Cloudflare dashboard (traderay.forumarac.com → http://ui:8501),
+  # the dashboard becomes reachable via Cloudflare Access (Zero Trust auth).
+  # The token is read from .env at compose-time substitution.
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: traderay-cloudflared
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARED_TOKEN}
+    networks:
+      - traderay_net
+    depends_on:
+      ui:
+        condition: service_started
+
 networks:
   traderay_net:
     driver: bridge
