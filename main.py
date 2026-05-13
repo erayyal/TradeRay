@@ -46,17 +46,10 @@ log = get_logger("traderay.main")
 
 
 # ---------------------------------------------------------------------------
-# Default symbol roster (only used on the very first boot — afterwards the
-# UI / DB owns this state). Edit MarketConfig.symbols_csv at runtime to
-# change the watchlist without restarting the process.
+# NO HARDCODED SYMBOLS — the boot seeder creates empty MarketConfig rows;
+# the Dynamic Screener fills each market's symbol list every cycle from
+# Binance 24h volume (Crypto) and yfinance daily movers (Equities).
 # ---------------------------------------------------------------------------
-
-DEFAULT_SYMBOLS: dict[MarketType, list[str]] = {
-    MarketType.CRYPTO: ["BTCUSDT", "ETHUSDT"],
-    MarketType.BIST:   ["THYAO.IS", "ASELS.IS", "GARAN.IS"],
-    MarketType.SP500:  ["AAPL", "MSFT", "^GSPC"],
-    MarketType.NASDAQ: ["NVDA", "TSLA", "^IXIC"],
-}
 
 
 # ---------------------------------------------------------------------------
@@ -101,13 +94,23 @@ async def main() -> None:
         markets=[m.value for m in MarketType],
     )
 
-    # 1. ORM schema + default config seed (idempotent)
+    # 1. ORM schema + COLD START seed (idempotent — every flag off)
     await init_db()
-    await seed_default_market_config(DEFAULT_SYMBOLS)
+    await seed_default_market_config()
     log.info("traderay.db_ready")
 
     # 2. Redis (UI live state + per-tick scratchpad)
     await cache.connect()
+
+    # 3. First-boot defaults in Redis:
+    #    - system master switch absent  → leave absent (= OFF, safest)
+    #    - per-market dynamic_screener absent → enable it (no hardcoded symbols
+    #      means the screener MUST run for the market to have anything to do)
+    for market in MarketType:
+        key = f"config:{market.value}:dynamic_screener"
+        if await cache.client.get(key) is None:
+            await cache.client.set(key, "1")
+            log.info("traderay.screener_default_on", market=market.value)
 
     # 3. Scheduler — read DB, register one job per enabled market
     scheduler = build_scheduler()

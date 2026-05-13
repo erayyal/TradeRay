@@ -102,7 +102,36 @@ class ExecutionEngine:
                 reason="traditional_market_signal_only",
             )
 
-        # 2. Always persist the signal — UI / backtest / audit depend on it.
+        action = decision.get("decision", "WAIT")
+
+        # 1b. ZERO-TOLERANCE TP/SL gate.
+        # A LONG / SHORT decision without complete entry + TP + SL is INVALID
+        # — it must NOT be persisted to the DB and NOT be routed to Binance.
+        # The signal is rejected outright. This blocks malformed AI output
+        # AND any future bug in the rule engine that produces partial plans.
+        if action in ("LONG", "SHORT"):
+            tp = decision.get("take_profit")
+            sl = decision.get("stop_loss")
+            entry = decision.get("entry") or decision.get("entry_price")
+            if tp is None or sl is None or entry is None:
+                log.warning(
+                    "engine.rejected_missing_tp_sl",
+                    symbol=symbol, market=market.value, action=action,
+                    has_entry=entry is not None,
+                    has_tp=tp is not None,
+                    has_sl=sl is not None,
+                )
+                return {
+                    "signal_id": None,
+                    "trade_id": None,
+                    "executed": False,
+                    "effective_mode": effective_mode,
+                    "reason": "rejected_missing_tp_sl",
+                }
+
+        # 2. Persist the signal — UI / backtest / audit depend on it.
+        # WAIT signals ARE persisted (audit trail). Only the strict TP/SL
+        # gate above can drop a row before this line runs.
         signal_id = await self._persist_signal(
             market=market,
             term=term,
@@ -113,8 +142,6 @@ class ExecutionEngine:
             fear_greed_index=fear_greed_index,
             macro_regime=macro_regime,
         )
-
-        action = decision.get("decision", "WAIT")
 
         # 3. Branch: WAIT → done.
         if action == "WAIT":

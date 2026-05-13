@@ -1,30 +1,17 @@
-"""TradeRay — Advanced Streamlit Dashboard (resolution-aware).
+"""TradeRay — clean, bilingual (TR/EN) dashboard.
 
-Reads from the SQLite/Postgres ORM (signals, trades, market_config) and
-Redis (latest decisions + cached prices). Writes user toggles back to
-MarketConfig + a Redis flag for the dynamic screener.
+Design goals (final v1.0):
+  - Sidebar: language picker, master switch, per-market controls (enabled,
+    use_ai, term, execution_mode for crypto only, dynamic_screener).
+  - PnL Matrix: per-market split (Crypto Bot / Crypto Signals / BIST / US),
+    plus a Total card. Daily / Weekly / Monthly windows.
+  - Tabs: Signals / Trades / Latest Decisions / API Costs.
+  - Help: modal popup ("How to use") accessible from sidebar.
 
-PnL Matrix data sources, by priority:
-
-    Realized PnL (Crypto AUTO_BOT)
-        Trade.realized_pnl_usd  ←  set by tracker.sync_binance_orders()
-
-    Theoretical PnL (all signals)
-        Per-signal preference:
-          1. Signal.raw_payload["resolution"]  ←  set by tracker.sync_theoretical_signals()
-                                                  Authoritative — replay-confirmed
-                                                  win/loss with exact exit price.
-          2. Snapshot heuristic                 ←  computed in this file.
-                                                  current_price vs entry/TP/SL,
-                                                  used only when no resolution
-                                                  exists yet ("Floating / MTM").
-
-Layout:
-  Sidebar         : Market controls (enable, term, exec_mode, screener)
-  PnL Matrix      : Daily / Weekly / Monthly with resolved + floating split
-  Tab 1           : Active Signals (with resolution status badge)
-  Tab 2           : Executed Trades
-  Tab 3           : Latest Decisions (chart-aware decision viewer)
+Defense-in-depth:
+  - SQLA_DISABLE_POOL=true uses NullPool — every Streamlit rerun gets a fresh
+    asyncpg connection, no cross-event-loop binding issues.
+  - All db / redis ops wrapped in `_run_async` so cached calls share semantics.
 """
 from __future__ import annotations
 
@@ -63,9 +50,133 @@ st.set_page_config(
     page_icon="📈",
     initial_sidebar_state="expanded",
 )
-
-# Auto-refresh every 30 seconds
 st.markdown("<meta http-equiv='refresh' content='30'>", unsafe_allow_html=True)
+
+
+# ============================================================================
+# i18n — single source of truth for all UI strings
+# ============================================================================
+
+_STRINGS: dict[str, dict[str, str]] = {
+    # --- Header ---
+    "app_title":           {"tr": "📈 TradeRay — Küresel Finans Terminali",
+                            "en": "📈 TradeRay — Global Financial Terminal"},
+    "as_of":               {"tr": "Güncelleme",   "en": "As of"},
+    "auto_refresh":        {"tr": "30sn'de bir otomatik yenileniyor",
+                            "en": "Auto-refresh every 30s"},
+    # --- Sidebar ---
+    "language":            {"tr": "🌐 Dil",       "en": "🌐 Language"},
+    "system":              {"tr": "Sistem",       "en": "System"},
+    "system_running":      {"tr": "🟢 ÇALIŞIYOR", "en": "🟢 RUNNING"},
+    "system_paused":       {"tr": "🔴 DURDU",     "en": "🔴 PAUSED"},
+    "master_switch":       {"tr": "Botu aç (master switch)",
+                            "en": "Enable bot (master switch)"},
+    "master_help":         {"tr": "Kapalıyken hiçbir döngü çalışmaz — LLM çağrısı yok, emir yok, jeton harcaması yok.",
+                            "en": "When OFF, no cycles fire — no LLM calls, no orders, no token spend."},
+    "market_controls":     {"tr": "⚙️ Piyasa Kontrolleri",
+                            "en": "⚙️ Market Controls"},
+    "enabled":             {"tr": "Aktif",        "en": "Enabled"},
+    "use_ai":              {"tr": "AI Kullan",    "en": "Use AI"},
+    "use_ai_help":         {"tr": "Açıkken kural motoru bir setup bulduğunda Master Trader LLM doğrular. Kapalıyken sadece kural motoru çalışır (jeton harcamaz).",
+                            "en": "When ON, Master Trader LLM verifies any setup the rule engine finds. When OFF, only the rule engine runs (zero tokens)."},
+    "term":                {"tr": "Zaman Dilimi", "en": "Term"},
+    "execution":           {"tr": "Yürütme",      "en": "Execution"},
+    "exec_locked":         {"tr": "🔒 Bu piyasa SADECE-SİNYAL (execution/engine.py'de sabit).",
+                            "en": "🔒 This market is SIGNAL-ONLY (hard-locked in execution/engine.py)."},
+    "dynamic_screener":    {"tr": "Dinamik tarayıcı",
+                            "en": "Dynamic screener"},
+    "screener_help":       {"tr": "Açıkken orkestratör her döngüde sembol listesini fetcher.get_dynamic_symbols() ile günceller.",
+                            "en": "When ON, the orchestrator refreshes the symbol list each cycle via fetcher.get_dynamic_symbols()."},
+    "symbols":             {"tr": "Semboller (virgülle)",
+                            "en": "Symbols (comma-separated)"},
+    "symbols_disabled":    {"tr": "Dinamik tarayıcı açıkken devre dışı.",
+                            "en": "Disabled while dynamic screener is ON."},
+    "last_run":            {"tr": "Son döngü",    "en": "Last run"},
+    "apply":               {"tr": "Uygula",       "en": "Apply"},
+    "updated":             {"tr": "güncellendi",  "en": "updated"},
+    # --- Help dialog ---
+    "help_button":         {"tr": "❓ Nasıl Kullanılır?", "en": "❓ How to use"},
+    "help_title":          {"tr": "TradeRay — Hızlı Kullanım Kılavuzu",
+                            "en": "TradeRay — Quick start guide"},
+    # --- KPI strip ---
+    "active_markets":      {"tr": "Aktif Piyasalar",     "en": "Active Markets"},
+    "signals_30d":         {"tr": "Sinyaller (30g)",     "en": "Signals (30d)"},
+    "non_wait":            {"tr": "İşlem Sinyali",       "en": "Actionable"},
+    "resolved":            {"tr": "Çözüldü",             "en": "Resolved"},
+    "open_trades":         {"tr": "Açık İşlem",          "en": "Open Trades"},
+    "today_cost":          {"tr": "Bugünkü API Maliyeti","en": "Today's API Cost"},
+    "calls":               {"tr": "çağrı",               "en": "calls"},
+    # --- PnL Matrix ---
+    "pnl_title":           {"tr": "💰 PnL Matrisi",      "en": "💰 PnL Matrix"},
+    "pnl_caption":         {"tr": "Gerçekleşen PnL = Borsada kapanan Crypto AUTO_BOT trade'leri. "
+                                  "Teorik PnL = Sinyallerin TP/SL'ye değme durumuna göre simülasyon. "
+                                  "Genel toplam tüm borsaları birleştirir.",
+                            "en": "Realized PnL = closed Crypto AUTO_BOT trades. "
+                                  "Theoretical PnL = signals scored against TP/SL touches. "
+                                  "Total combines all markets."},
+    "crypto_bot":          {"tr": "🪙 Crypto Bot (Gerçek)", "en": "🪙 Crypto Bot (Realized)"},
+    "crypto_signals":      {"tr": "📡 Crypto Sinyalleri",   "en": "📡 Crypto Signals"},
+    "bist_signals":        {"tr": "🇹🇷 BIST Sinyalleri",    "en": "🇹🇷 BIST Signals"},
+    "us_signals":          {"tr": "🇺🇸 ABD Sinyalleri",     "en": "🇺🇸 US Signals"},
+    "total_pnl":           {"tr": "🎯 GENEL TOPLAM",        "en": "🎯 TOTAL"},
+    "daily":               {"tr": "Günlük",   "en": "Daily"},
+    "weekly":              {"tr": "Haftalık", "en": "Weekly"},
+    "monthly":             {"tr": "Aylık",    "en": "Monthly"},
+    "trades":              {"tr": "trade",    "en": "trades"},
+    "win_rate":            {"tr": "kazanma oranı", "en": "win rate"},
+    "open_n":              {"tr": "açık",     "en": "open"},
+    "resolved_pnl":        {"tr": "kesinleşen", "en": "resolved"},
+    "floating_mtm":        {"tr": "mtm",      "en": "MTM"},
+    # --- Tabs ---
+    "tab_signals":         {"tr": "📡 Sinyaller",        "en": "📡 Signals"},
+    "tab_trades":          {"tr": "🪙 Trade'ler",         "en": "🪙 Trades"},
+    "tab_decisions":       {"tr": "🧠 Son Kararlar",      "en": "🧠 Latest Decisions"},
+    "tab_costs":           {"tr": "💰 API Maliyetleri",   "en": "💰 API Costs"},
+    "tab_signals_title":   {"tr": "### 📡 Aktif Sinyaller (son 30 gün)",
+                            "en": "### 📡 Active Signals (last 30 days)"},
+    "filter_market":       {"tr": "Piyasa",   "en": "Market"},
+    "filter_action":       {"tr": "Aksiyon",  "en": "Action"},
+    "filter_resolution":   {"tr": "Çözüm",    "en": "Resolution"},
+    "no_signals":          {"tr": "Bu filtreye uygun sinyal yok.",
+                            "en": "No signals match this filter."},
+    "tab_trades_title":    {"tr": "### 🪙 Gerçekleşmiş Crypto Trade'leri (son 90 gün)",
+                            "en": "### 🪙 Executed Crypto Trades (last 90 days)"},
+    "no_trades":           {"tr": "Henüz trade yok — Crypto AUTO_BOT moduna alınmalı.",
+                            "en": "No trades yet — Crypto must be in AUTO_BOT mode."},
+    "tab_decisions_title": {"tr": "### 🧠 Sembol Bazlı Son Kararlar",
+                            "en": "### 🧠 Latest Decisions per Symbol"},
+    "no_decisions":        {"tr": "Redis'te cache'lenmiş karar yok — ilk döngüyü bekle.",
+                            "en": "No decisions cached in Redis yet — wait for the first cycle."},
+    "tab_costs_title":     {"tr": "### 💰 LLM API Maliyetleri (bugün, UTC)",
+                            "en": "### 💰 LLM API Costs (today, UTC)"},
+    "no_costs":            {"tr": "Bugün hiç LLM çağrısı kaydedilmedi.",
+                            "en": "No LLM calls logged yet today."},
+    # --- Decision card labels ---
+    "justification":       {"tr": "Gerekçe",  "en": "Justification"},
+    "chart_obs":           {"tr": "Grafik gözlemleri", "en": "Chart observations"},
+    "rule_refs":           {"tr": "Kural referansları","en": "Rulebook references"},
+    "conflict":            {"tr": "Çatışma uyarıları", "en": "Conflict flags"},
+    "live_price":          {"tr": "Anlık Fiyat", "en": "Live Price"},
+    "entry":               {"tr": "Giriş",       "en": "Entry"},
+    "tp":                  {"tr": "Kâr Al",      "en": "Take-Profit"},
+    "sl":                  {"tr": "Zarar Durdur","en": "Stop-Loss"},
+    "rr":                  {"tr": "R:R",         "en": "R:R"},
+    "risk":                {"tr": "Risk",        "en": "Risk"},
+    "lev":                 {"tr": "Kaldıraç",    "en": "Leverage"},
+    "source_rule":         {"tr": "⚙️ Kural motoru", "en": "⚙️ Rule engine"},
+    "source_ai":           {"tr": "🤖 AI doğruladı", "en": "🤖 AI verified"},
+    "view_full_json":      {"tr": "📋 Karar JSON", "en": "📋 Full decision JSON"},
+    "view_quant":          {"tr": "📊 Quant raporu", "en": "📊 Quant report"},
+    "view_sentiment":      {"tr": "📰 Duyarlılık raporu", "en": "📰 Sentiment report"},
+}
+
+
+def _lang() -> str:
+    return st.session_state.get("lang", "tr")
+
+
+def t(key: str) -> str:
+    return _STRINGS.get(key, {}).get(_lang(), key)
 
 
 # ============================================================================
@@ -76,7 +187,7 @@ def _run_async(coro):
     return asyncio.run(coro)
 
 
-# -- DB reads ----------------------------------------------------------------
+# -- DB --------------------------------------------------------------------
 
 async def _aload_market_configs() -> list[dict[str, Any]]:
     async with AsyncSessionLocal() as session:
@@ -85,6 +196,7 @@ async def _aload_market_configs() -> list[dict[str, Any]]:
         {
             "market": r.market.value,
             "enabled": r.enabled,
+            "use_ai": r.use_ai,
             "term": r.term.value,
             "execution_mode": r.execution_mode.value,
             "symbols_csv": r.symbols_csv,
@@ -95,7 +207,7 @@ async def _aload_market_configs() -> list[dict[str, Any]]:
 
 
 async def _asave_market_config(
-    *, market: MarketType, enabled: bool, term: Term,
+    *, market: MarketType, enabled: bool, use_ai: bool, term: Term,
     execution_mode: ExecutionMode, symbols_csv: str,
 ) -> None:
     async with AsyncSessionLocal() as session:
@@ -108,26 +220,23 @@ async def _asave_market_config(
             row = MarketConfig(market=market)
             session.add(row)
         row.enabled = enabled
+        row.use_ai = use_ai
         row.term = term
         row.execution_mode = execution_mode
         row.symbols_csv = symbols_csv
         await session.commit()
 
 
-async def _aload_signals(
-    *, days_back: int = 30, market: str | None = None
-) -> list[dict[str, Any]]:
-    """Load signals + raw_payload (the tracker stores resolution there)."""
+async def _aload_signals(*, days_back: int = 30) -> list[dict[str, Any]]:
     cutoff = datetime.now(timezone.utc) - timedelta(days=days_back)
-    stmt = (
-        select(Signal)
-        .where(Signal.created_at >= cutoff)
-        .order_by(Signal.created_at.desc())
-    )
-    if market:
-        stmt = stmt.where(Signal.market == MarketType(market))
     async with AsyncSessionLocal() as session:
-        rows = (await session.execute(stmt)).scalars().all()
+        rows = (
+            await session.execute(
+                select(Signal).where(Signal.created_at >= cutoff).order_by(
+                    Signal.created_at.desc()
+                )
+            )
+        ).scalars().all()
     return [
         {
             "id": r.id,
@@ -153,45 +262,16 @@ async def _aload_signals(
     ]
 
 
-async def _aload_cost_logs(*, days_back: int = 7) -> list[dict[str, Any]]:
-    """Load LLM cost rows from the last `days_back` days, newest first.
-
-    Default 7d keeps the KPI math cheap (a busy day produces ~1k–5k rows).
-    The KPI strip filters down to "today" in Python; the tab table caller
-    can re-filter or slice further.
-    """
+async def _aload_trades(*, days_back: int = 90) -> list[dict[str, Any]]:
     cutoff = datetime.now(timezone.utc) - timedelta(days=days_back)
     async with AsyncSessionLocal() as session:
         rows = (
             await session.execute(
-                select(LLMCostLog)
-                .where(LLMCostLog.created_at >= cutoff)
-                .order_by(LLMCostLog.created_at.desc())
+                select(Trade).where(Trade.created_at >= cutoff).order_by(
+                    Trade.created_at.desc()
+                )
             )
         ).scalars().all()
-    return [
-        {
-            "id": r.id,
-            "created_at": r.created_at,
-            "market": r.market.value if r.market else None,
-            "symbol": r.symbol,
-            "agent_label": r.agent_label,
-            "model": r.model,
-            "input_tokens": r.input_tokens,
-            "output_tokens": r.output_tokens,
-            "estimated_cost_usd": r.estimated_cost_usd,
-        }
-        for r in rows
-    ]
-
-
-async def _aload_trades(*, days_back: int = 90) -> list[dict[str, Any]]:
-    cutoff = datetime.now(timezone.utc) - timedelta(days=days_back)
-    stmt = select(Trade).where(Trade.created_at >= cutoff).order_by(
-        Trade.created_at.desc()
-    )
-    async with AsyncSessionLocal() as session:
-        rows = (await session.execute(stmt)).scalars().all()
     return [
         {
             "id": r.id,
@@ -212,7 +292,33 @@ async def _aload_trades(*, days_back: int = 90) -> list[dict[str, Any]]:
     ]
 
 
-# -- Redis reads -------------------------------------------------------------
+async def _aload_cost_logs(*, days_back: int = 7) -> list[dict[str, Any]]:
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days_back)
+    async with AsyncSessionLocal() as session:
+        rows = (
+            await session.execute(
+                select(LLMCostLog).where(LLMCostLog.created_at >= cutoff).order_by(
+                    LLMCostLog.created_at.desc()
+                )
+            )
+        ).scalars().all()
+    return [
+        {
+            "id": r.id,
+            "created_at": r.created_at,
+            "market": r.market.value if r.market else None,
+            "symbol": r.symbol,
+            "agent_label": r.agent_label,
+            "model": r.model,
+            "input_tokens": r.input_tokens,
+            "output_tokens": r.output_tokens,
+            "estimated_cost_usd": r.estimated_cost_usd,
+        }
+        for r in rows
+    ]
+
+
+# -- Redis -----------------------------------------------------------------
 
 async def _aload_redis_state() -> dict[str, Any]:
     r = redis_asyncio.from_url(settings.redis_url, decode_responses=True)
@@ -231,6 +337,21 @@ async def _aload_redis_state() -> dict[str, Any]:
                         pass
             flag = await r.get(f"config:{cfg['market']}:dynamic_screener")
             out["screener_flags"][cfg["market"]] = (flag == "1")
+
+        # Also collect prices/decisions for any symbol that has a cached
+        # decision but isn't in symbols_csv (screener-picked symbols)
+        async for key in r.scan_iter("decision:*:latest"):
+            sym = key.split(":")[1]
+            if sym not in out["decisions"]:
+                d = await r.get(key)
+                if d:
+                    try:
+                        out["decisions"][sym] = json.loads(d)
+                    except json.JSONDecodeError:
+                        pass
+            if sym not in out["prices"]:
+                p = await r.get(f"price:{sym}")
+                out["prices"][sym] = float(p) if p else None
     finally:
         await r.aclose()
     return out
@@ -245,7 +366,6 @@ async def _aset_screener_flag(market: str, value: bool) -> None:
 
 
 async def _aread_system_enabled() -> bool:
-    """Master switch state — `config:system_enabled` Redis key. False default."""
     r = redis_asyncio.from_url(settings.redis_url, decode_responses=True)
     try:
         return (await r.get("config:system_enabled")) == "1"
@@ -261,7 +381,7 @@ async def _awrite_system_enabled(value: bool) -> None:
         await r.aclose()
 
 
-# -- Streamlit cache wrappers ------------------------------------------------
+# -- Streamlit cache wrappers ----------------------------------------------
 
 @st.cache_data(ttl=10)
 def load_market_configs() -> list[dict[str, Any]]:
@@ -279,33 +399,29 @@ def load_trades(days_back: int = 90) -> list[dict[str, Any]]:
 
 
 @st.cache_data(ttl=10)
-def load_cost_logs(days_back: int = 7) -> list[dict[str, Any]]:
-    return _run_async(_aload_cost_logs(days_back=days_back))
-
-
-@st.cache_data(ttl=10)
 def load_redis_state() -> dict[str, Any]:
     return _run_async(_aload_redis_state())
 
 
+@st.cache_data(ttl=10)
+def load_cost_logs(days_back: int = 7) -> list[dict[str, Any]]:
+    return _run_async(_aload_cost_logs(days_back=days_back))
+
+
 @st.cache_data(ttl=5)
 def load_system_enabled() -> bool:
-    """Cached read of the master switch (5s TTL — propagation matters)."""
     return _run_async(_aread_system_enabled())
 
 
 # ============================================================================
-# Resolution helpers — single source of truth for "what does the tracker say
-# about this signal" — used by both the PnL math and the signal table badge.
+# Resolution + PnL math
 # ============================================================================
 
 def _signal_resolution(signal: dict[str, Any]) -> dict[str, Any] | None:
-    """Return the tracker-written resolution dict, or None if not resolved."""
     return (signal.get("raw_payload") or {}).get("resolution") or None
 
 
 def _resolution_status(signal: dict[str, Any]) -> str:
-    """Short label for the Active Signals table."""
     if signal["action"] == SignalAction.WAIT.value:
         return "—"
     res = _signal_resolution(signal)
@@ -314,21 +430,17 @@ def _resolution_status(signal: dict[str, Any]) -> str:
     return res.get("status", "OPEN")
 
 
-# ============================================================================
-# PnL math
-# ============================================================================
-
 def _bucket_window(now: datetime) -> dict[str, datetime]:
-    today_utc = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+    today = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
     return {
-        "daily": today_utc,
-        "weekly": today_utc - timedelta(days=today_utc.weekday()),
+        "daily":   today,
+        "weekly":  today - timedelta(days=today.weekday()),
         "monthly": datetime(now.year, now.month, 1, tzinfo=timezone.utc),
     }
 
 
-def compute_realized_pnl(trades: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    """Crypto AUTO_BOT realized PnL — only Trades that have closed."""
+def compute_realized_crypto_pnl(trades: list[dict]) -> dict[str, dict[str, Any]]:
+    """Realized PnL from CLOSED Trade rows (Crypto AUTO_BOT only)."""
     now = datetime.now(timezone.utc)
     windows = _bucket_window(now)
     closed = [
@@ -337,72 +449,57 @@ def compute_realized_pnl(trades: list[dict[str, Any]]) -> dict[str, dict[str, An
         and t["realized_pnl_usd"] is not None
         and t["closed_at"] is not None
     ]
-
-    out: dict[str, dict[str, Any]] = {}
+    out = {}
     for label, start in windows.items():
         slice_ = [t for t in closed if t["closed_at"] >= start]
         wins = [t for t in slice_ if (t["realized_pnl_usd"] or 0) > 0]
         losses = [t for t in slice_ if (t["realized_pnl_usd"] or 0) <= 0]
-        total_pnl = sum((t["realized_pnl_usd"] or 0) for t in slice_)
+        total = sum(t["realized_pnl_usd"] or 0 for t in slice_)
         out[label] = {
             "n_trades": len(slice_),
             "n_wins": len(wins),
             "n_losses": len(losses),
             "win_rate": (len(wins) / len(slice_)) if slice_ else 0.0,
-            "pnl_usd": total_pnl,
-            "avg_pnl_per_trade": (total_pnl / len(slice_)) if slice_ else 0.0,
+            "pnl_usd": total,
         }
     return out
 
 
-def compute_theoretical_pnl(
-    signals: list[dict[str, Any]], current_prices: dict[str, float | None]
+def compute_theoretical_pnl_by_market(
+    signals: list[dict], current_prices: dict[str, float | None],
+    market_filter: set[str],
 ) -> dict[str, dict[str, Any]]:
-    """Theoretical PnL with resolution-first / snapshot-fallback logic.
+    """Theoretical PnL aggregated across only the markets in `market_filter`.
 
-    For each non-WAIT signal in the window:
-      1. If raw_payload["resolution"] exists  → use the tracker's authoritative
-         result (`outcome` and `theoretical_pnl_usd`). Counts as resolved.
-      2. Otherwise → snapshot heuristic against the current market price.
-         Counts as floating MTM (open) — even if the snapshot says "TP touched
-         right now", we treat it as floating until the tracker confirms.
-
-    Position size for fallback: risk_usd / |entry - SL| (matches the executor's
-    sizing math). Win caps at +risk_usd × R:R, loss floors at -risk_usd.
+    Resolution-first: prefer the tracker's `resolution` block. Fall back to
+    a snapshot heuristic vs current price (floating MTM).
     """
     now = datetime.now(timezone.utc)
     windows = _bucket_window(now)
-
-    out: dict[str, dict[str, Any]] = {}
+    out = {}
     for label, start in windows.items():
         slice_ = [
             s for s in signals
             if s["created_at"] >= start
+            and s["market"] in market_filter
             and s["action"] in (SignalAction.LONG.value, SignalAction.SHORT.value)
             and s["entry"] is not None and s["sl"] is not None and s["tp"] is not None
             and s["risk_usd"] is not None and s["risk_usd"] > 0
         ]
-
-        wins_resolved = 0
-        losses_resolved = 0
-        open_n = 0
-        pnl_resolved = 0.0
-        pnl_floating_mtm = 0.0
-
+        wins = losses = open_n = 0
+        resolved_pnl = 0.0
+        mtm = 0.0
         for s in slice_:
-            # ---- 1. Resolution path (authoritative) -------------------------
             res = _signal_resolution(s)
             if res:
-                outcome = res.get("outcome")  # "TP" | "SL"
                 pnl = res.get("theoretical_pnl_usd") or 0.0
-                pnl_resolved += pnl
-                if outcome == "TP":
-                    wins_resolved += 1
+                resolved_pnl += pnl
+                if res.get("outcome") == "TP":
+                    wins += 1
                 else:
-                    losses_resolved += 1
+                    losses += 1
                 continue
 
-            # ---- 2. Snapshot path (floating MTM) ---------------------------
             entry, sl, tp, risk = s["entry"], s["sl"], s["tp"], s["risk_usd"]
             current = current_prices.get(s["symbol"])
             risk_per_unit = abs(entry - sl)
@@ -410,145 +507,193 @@ def compute_theoretical_pnl(
                 continue
             size_base = risk / risk_per_unit
             is_long = s["action"] == SignalAction.LONG.value
-
-            if current is None:
-                open_n += 1
-                continue
-
-            # We deliberately do NOT count snapshot TP/SL touches as resolved
-            # — that's the tracker's job. Until the tracker confirms with a
-            # candle replay, anything still in raw_payload-without-resolution
-            # is "open" for accounting purposes.
             open_n += 1
-            if is_long:
-                pnl_floating_mtm += (current - entry) * size_base
-            else:
-                pnl_floating_mtm += (entry - current) * size_base
+            if current is None:
+                continue
+            mtm += (current - entry) * size_base if is_long else (entry - current) * size_base
 
-        n_total = len(slice_)
-        n_resolved = wins_resolved + losses_resolved
+        n_resolved = wins + losses
         out[label] = {
-            "n_signals": n_total,
-            "n_wins": wins_resolved,
-            "n_losses": losses_resolved,
+            "n_signals": len(slice_),
+            "n_wins": wins,
+            "n_losses": losses,
             "n_open": open_n,
-            "win_rate": (wins_resolved / n_resolved) if n_resolved else 0.0,
-            "pnl_resolved": pnl_resolved,
-            "pnl_floating_mtm": pnl_floating_mtm,
-            "pnl_total": pnl_resolved + pnl_floating_mtm,
+            "win_rate": (wins / n_resolved) if n_resolved else 0.0,
+            "pnl_resolved": resolved_pnl,
+            "pnl_mtm": mtm,
+            "pnl_total": resolved_pnl + mtm,
         }
     return out
 
 
 # ============================================================================
-# UI — Sidebar
+# UI rendering
 # ============================================================================
 
 def _term_index(value: str) -> int:
     order = [Term.SCALP.value, Term.SHORT_TERM.value, Term.MID_TERM.value]
-    try:
-        return order.index(value)
-    except ValueError:
-        return 1
+    return order.index(value) if value in order else 1
 
 
-def render_sidebar(configs: list[dict[str, Any]], screener_flags: dict[str, bool]) -> None:
-    st.sidebar.title("⚙️ Market Controls")
-    st.sidebar.caption(
-        f"Model: `{settings.anthropic_model}` · "
-        f"Binance **{'Testnet' if settings.binance_testnet else 'LIVE'}**"
+@st.dialog("TradeRay — Quick Start / Hızlı Başlangıç", width="large")
+def show_help_dialog() -> None:
+    """Bilingual modal explaining how to operate the dashboard."""
+    if _lang() == "tr":
+        st.markdown(
+            """
+            ### 🚀 Hızlı Başlangıç
+
+            **1. Sistem'i Aç** — sidebar'da en üstteki master switch'i aç. Bu, scheduler'ı tetikler.
+
+            **2. Bir piyasa seç** — CRYPTO / BIST / SP500 / NASDAQ. Açtığın piyasa için:
+              - **Aktif**: piyasa döngüleri çalışsın
+              - **AI Kullan**: Kapalı → sadece kural motoru (jeton harcamaz). Açık → Quant + Sentiment + Master Trader LLM doğrulaması.
+              - **Dinamik tarayıcı**: sürekli açık tut. Piyasanın en yüksek hacim/volatilite sembollerini her döngüde otomatik tarar.
+              - **Yürütme** (sadece Crypto): SADECE-SİNYAL veya OTO-BOT (testnet'e gerçek emir gönderir).
+
+            **3. Uygula'ya bas** — değişiklikler bir sonraki döngüde geçerli olur.
+
+            ### 💰 Jeton Tasarrufu
+
+            - **Default**: tüm piyasalar kapalı, AI kapalı. Sıfır jeton harcaması.
+            - **Rule-only mode**: AI kapalı → motor TA-Lib ile karar verir, LLM çağrısı yok.
+            - **AI mode**: yalnızca kural motoru bir setup bulunca LLM çağrılır.
+
+            ### 🛡 TP/SL Kuralı
+
+            LONG ve SHORT sinyaller MUTLAKA TP ve SL içermeli. Yoksa engine direkt reddeder, DB'ye yazılmaz.
+            """
+        )
+    else:
+        st.markdown(
+            """
+            ### 🚀 Quick Start
+
+            **1. Enable the System** — flip the master switch at the top of the sidebar.
+
+            **2. Configure a market** — CRYPTO / BIST / SP500 / NASDAQ:
+              - **Enabled**: cycles fire for this market
+              - **Use AI**: OFF → pure rule engine (zero tokens). ON → Quant + Sentiment + Master Trader LLM verification.
+              - **Dynamic screener**: keep ON. Picks the top USDT perps by 24h volume / top equity movers automatically.
+              - **Execution** (Crypto only): SIGNAL-ONLY or AUTO-BOT (places real orders on testnet).
+
+            **3. Apply** — changes take effect on the next cycle tick.
+
+            ### 💰 Token Savings
+
+            - **Default**: every market OFF, AI OFF. Zero token spend.
+            - **Rule-only mode**: AI OFF → engine decides via TA-Lib, no LLM calls.
+            - **AI mode**: LLM is called ONLY when the rule engine finds a setup.
+
+            ### 🛡 TP/SL Rule
+
+            LONG and SHORT signals MUST carry TP and SL. Otherwise the engine rejects outright — no DB row, no order.
+            """
+        )
+
+
+def render_sidebar(
+    configs: list[dict[str, Any]], screener_flags: dict[str, bool]
+) -> None:
+    # Language picker
+    lang_choice = st.sidebar.selectbox(
+        t("language"),
+        options=["tr", "en"],
+        format_func=lambda x: {"tr": "🇹🇷 Türkçe", "en": "🇬🇧 English"}[x],
+        index=0 if _lang() == "tr" else 1,
+        key="lang_picker",
     )
+    if lang_choice != _lang():
+        st.session_state["lang"] = lang_choice
+        st.rerun()
 
-    # -------- MASTER SWITCH --------
-    # When OFF (default), the scheduler skips every market cycle — no LLM
-    # calls, no orders, no token spend. Tracker jobs still run to resolve
-    # in-flight trades, but no new decisions are made.
-    system_enabled = load_system_enabled()
-    status_emoji = "🟢" if system_enabled else "🔴"
-    status_word = "RUNNING" if system_enabled else "PAUSED"
-    st.sidebar.markdown(f"### {status_emoji} System: **{status_word}**")
+    # Help button → modal
+    if st.sidebar.button(t("help_button"), use_container_width=True):
+        show_help_dialog()
+
+    st.sidebar.markdown("---")
+
+    # Master switch
+    sys_on = load_system_enabled()
+    st.sidebar.markdown(
+        f"### {t('system')}: **{t('system_running') if sys_on else t('system_paused')}**"
+    )
     new_state = st.sidebar.toggle(
-        "Enable bot (master switch)",
-        value=system_enabled,
-        key="master_switch",
-        help=(
-            "When OFF, every market cycle is skipped. No LLM calls, no orders, "
-            "no token spend. Tracker still reconciles open positions."
-        ),
+        t("master_switch"), value=sys_on,
+        key="master_switch_toggle", help=t("master_help"),
     )
-    if new_state != system_enabled:
+    if new_state != sys_on:
         _run_async(_awrite_system_enabled(new_state))
         st.cache_data.clear()
-        st.success(
-            "✅ Bot RESUMED — cycles will fire on next tick."
-            if new_state else
-            "⏸ Bot PAUSED — no new cycles will run."
-        )
         st.rerun()
+
     st.sidebar.markdown("---")
+    st.sidebar.markdown(f"### {t('market_controls')}")
+    st.sidebar.caption(
+        f"`{settings.anthropic_model}` · Binance "
+        f"**{'Testnet' if settings.binance_testnet else 'LIVE'}**"
+    )
 
     cfg_by_market = {c["market"]: c for c in configs}
 
     for market_value in (m.value for m in MarketType):
         cfg = cfg_by_market.get(market_value)
         if cfg is None:
-            st.sidebar.warning(f"No config row for {market_value} — boot the backend.")
             continue
 
-        with st.sidebar.expander(f"🌐 {market_value}", expanded=(market_value == "CRYPTO")):
+        with st.sidebar.expander(
+            f"🌐 {market_value}", expanded=(market_value == "CRYPTO")
+        ):
             enabled = st.toggle(
-                "Enabled", value=cfg["enabled"], key=f"enabled:{market_value}",
+                t("enabled"), value=cfg["enabled"], key=f"enabled:{market_value}",
             )
-
+            use_ai = st.toggle(
+                t("use_ai"), value=cfg["use_ai"],
+                key=f"use_ai:{market_value}", help=t("use_ai_help"),
+            )
             term_value = st.radio(
-                "Term",
+                t("term"),
                 options=[Term.SCALP.value, Term.SHORT_TERM.value, Term.MID_TERM.value],
                 index=_term_index(cfg["term"]),
-                horizontal=False,
                 key=f"term:{market_value}",
             )
 
             if market_value == MarketType.CRYPTO.value:
                 exec_mode = st.radio(
-                    "Execution",
+                    t("execution"),
                     options=[ExecutionMode.SIGNAL_ONLY.value, ExecutionMode.AUTO_BOT.value],
                     index=(0 if cfg["execution_mode"] == ExecutionMode.SIGNAL_ONLY.value else 1),
                     horizontal=True,
                     key=f"exec:{market_value}",
-                    help="AUTO_BOT places real orders on Binance Testnet.",
                 )
             else:
-                st.info(
-                    f"🔒 {market_value} is **SIGNAL_ONLY** (hard-locked in execution/engine.py)."
-                )
+                st.info(t("exec_locked"))
                 exec_mode = ExecutionMode.SIGNAL_ONLY.value
 
             screener_on = st.toggle(
-                "Dynamic screener",
-                value=screener_flags.get(market_value, False),
-                key=f"screener:{market_value}",
-                help=(
-                    "If ON, the orchestrator overrides the symbol list with "
-                    "`fetcher.get_dynamic_symbols()` on each tick."
-                ),
+                t("dynamic_screener"),
+                value=screener_flags.get(market_value, True),
+                key=f"screener:{market_value}", help=t("screener_help"),
             )
 
             symbols_csv = st.text_input(
-                "Symbols (comma-separated)",
+                t("symbols"),
                 value=cfg["symbols_csv"],
                 key=f"symbols:{market_value}",
                 disabled=screener_on,
-                help="Disabled while dynamic screener is ON.",
+                help=t("symbols_disabled") if screener_on else "",
             )
 
             if cfg["last_run_at"]:
-                st.caption(f"Last run: {cfg['last_run_at']:%Y-%m-%d %H:%M UTC}")
+                st.caption(
+                    f"{t('last_run')}: {cfg['last_run_at']:%Y-%m-%d %H:%M UTC}"
+                )
 
-            if st.button("Apply", key=f"apply:{market_value}", type="primary"):
+            if st.button(t("apply"), key=f"apply:{market_value}", type="primary"):
                 _run_async(
                     _asave_market_config(
                         market=MarketType(market_value),
-                        enabled=enabled,
+                        enabled=enabled, use_ai=use_ai,
                         term=Term(term_value),
                         execution_mode=ExecutionMode(exec_mode),
                         symbols_csv=symbols_csv,
@@ -556,94 +701,127 @@ def render_sidebar(configs: list[dict[str, Any]], screener_flags: dict[str, bool
                 )
                 _run_async(_aset_screener_flag(market_value, screener_on))
                 st.cache_data.clear()
-                st.success(f"{market_value} updated. New cadence applies on next reload.")
+                st.success(f"{market_value} {t('updated')}.")
                 st.rerun()
 
 
-# ============================================================================
-# UI — PnL Matrix
-# ============================================================================
-
-def _render_pnl_card(*, title: str, realized: dict, theoretical: dict) -> None:
-    st.subheader(title)
-    cols = st.columns(2)
-
-    with cols[0]:
-        st.markdown("**🪙 Crypto AUTO_BOT — Realized**")
+def _pnl_card(title: str, stats: dict[str, Any], is_realized: bool) -> None:
+    st.markdown(f"**{title}**")
+    if is_realized:
         st.metric(
-            "PnL (USD)",
-            f"${realized['pnl_usd']:,.2f}",
+            "USD",
+            f"${stats['pnl_usd']:,.2f}",
             delta=(
-                f"{realized['n_wins']}W / {realized['n_losses']}L "
-                f"({realized['win_rate']:.0%})"
+                f"{stats['n_wins']}W / {stats['n_losses']}L "
+                f"({stats['win_rate']:.0%})"
+            ),
+        )
+        st.caption(f"{stats['n_trades']} {t('trades')}")
+    else:
+        st.metric(
+            "USD",
+            f"${stats['pnl_total']:,.2f}",
+            delta=(
+                f"{stats['n_wins']}W / {stats['n_losses']}L · "
+                f"{stats['n_open']} {t('open_n')}"
             ),
         )
         st.caption(
-            f"{realized['n_trades']} closed trades · "
-            f"avg ${realized['avg_pnl_per_trade']:,.2f}"
-        )
-
-    with cols[1]:
-        st.markdown("**📡 All Signals — Theoretical**")
-        st.metric(
-            "PnL (USD)",
-            f"${theoretical['pnl_total']:,.2f}",
-            delta=(
-                f"{theoretical['n_wins']}W / {theoretical['n_losses']}L "
-                f"· {theoretical['n_open']} open"
-            ),
-        )
-        st.caption(
-            f"resolved ${theoretical['pnl_resolved']:,.2f} · "
-            f"floating MTM ${theoretical['pnl_floating_mtm']:,.2f} · "
-            f"win rate {theoretical['win_rate']:.0%}"
+            f"{t('resolved_pnl')} ${stats['pnl_resolved']:,.2f} · "
+            f"{t('floating_mtm')} ${stats['pnl_mtm']:,.2f}"
         )
 
 
-def render_pnl_matrix(trades: list[dict], signals: list[dict], prices: dict[str, float | None]) -> None:
-    realized = compute_realized_pnl(trades)
-    theoretical = compute_theoretical_pnl(signals, prices)
+def render_pnl_matrix(
+    trades: list[dict], signals: list[dict],
+    prices: dict[str, float | None],
+) -> None:
+    st.markdown(f"### {t('pnl_title')}")
+    st.caption(t("pnl_caption"))
 
-    st.markdown("### 💰 PnL Matrix")
-    st.caption(
-        "**Realized PnL** = closed Crypto AUTO_BOT trades (Trade.realized_pnl_usd, "
-        "set by the tracker after Binance reconciliation). "
-        "**Theoretical PnL** = signal performance, resolution-first: the tracker "
-        "replays candles and writes `Signal.raw_payload['resolution']` with the "
-        "exact win/loss; signals without a resolution are shown as floating MTM "
-        "(current price vs entry). Win rate counts only resolved signals."
+    # Daily window for the per-market cards (the hot view)
+    realized = compute_realized_crypto_pnl(trades)["daily"]
+    crypto_sig = compute_theoretical_pnl_by_market(
+        signals, prices, {MarketType.CRYPTO.value}
+    )["daily"]
+    bist_sig = compute_theoretical_pnl_by_market(
+        signals, prices, {MarketType.BIST.value}
+    )["daily"]
+    us_sig = compute_theoretical_pnl_by_market(
+        signals, prices, {MarketType.SP500.value, MarketType.NASDAQ.value}
+    )["daily"]
+
+    total = (
+        realized["pnl_usd"]
+        + crypto_sig["pnl_total"]
+        + bist_sig["pnl_total"]
+        + us_sig["pnl_total"]
     )
 
-    cols = st.columns(3)
+    # 5 cards side by side: 4 markets + grand total
+    cols = st.columns(5)
     with cols[0]:
-        _render_pnl_card(title="📅 Daily", realized=realized["daily"], theoretical=theoretical["daily"])
+        _pnl_card(t("crypto_bot"), realized, is_realized=True)
     with cols[1]:
-        _render_pnl_card(title="📆 Weekly (Mon→now)", realized=realized["weekly"], theoretical=theoretical["weekly"])
+        _pnl_card(t("crypto_signals"), crypto_sig, is_realized=False)
     with cols[2]:
-        _render_pnl_card(title="🗓️ Monthly (MTD)", realized=realized["monthly"], theoretical=theoretical["monthly"])
+        _pnl_card(t("bist_signals"), bist_sig, is_realized=False)
+    with cols[3]:
+        _pnl_card(t("us_signals"), us_sig, is_realized=False)
+    with cols[4]:
+        st.markdown(f"**{t('total_pnl')}**")
+        st.metric("USD", f"${total:,.2f}")
+        st.caption(t("daily"))
 
+    # Compact weekly/monthly totals below
+    realized_w = compute_realized_crypto_pnl(trades)
+    crypto_w = compute_theoretical_pnl_by_market(
+        signals, prices, {MarketType.CRYPTO.value}
+    )
+    bist_w = compute_theoretical_pnl_by_market(
+        signals, prices, {MarketType.BIST.value}
+    )
+    us_w = compute_theoretical_pnl_by_market(
+        signals, prices, {MarketType.SP500.value, MarketType.NASDAQ.value}
+    )
 
-# ============================================================================
-# UI — Tabs
-# ============================================================================
+    with st.expander(f"📊 {t('weekly')} / {t('monthly')}"):
+        rows = []
+        for window, label in (("daily", t("daily")), ("weekly", t("weekly")), ("monthly", t("monthly"))):
+            total_w = (
+                realized_w[window]["pnl_usd"]
+                + crypto_w[window]["pnl_total"]
+                + bist_w[window]["pnl_total"]
+                + us_w[window]["pnl_total"]
+            )
+            rows.append({
+                "Period": label,
+                "Crypto Bot": f"${realized_w[window]['pnl_usd']:,.2f}",
+                "Crypto Sig": f"${crypto_w[window]['pnl_total']:,.2f}",
+                "BIST":       f"${bist_w[window]['pnl_total']:,.2f}",
+                "US":         f"${us_w[window]['pnl_total']:,.2f}",
+                "TOTAL":      f"${total_w:,.2f}",
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
 
 def render_signals_tab(signals: list[dict]) -> None:
-    st.markdown("### 📡 Active Signals (last 30 days)")
-
+    st.markdown(t("tab_signals_title"))
     fcols = st.columns([1, 1, 1, 2])
     with fcols[0]:
         market_filter = st.selectbox(
-            "Market", options=["ALL"] + [m.value for m in MarketType], index=0,
+            t("filter_market"),
+            options=["ALL"] + [m.value for m in MarketType], index=0,
         )
     with fcols[1]:
         action_filter = st.selectbox(
-            "Action", options=["ALL", "LONG", "SHORT", "WAIT"], index=0,
+            t("filter_action"),
+            options=["ALL", "LONG", "SHORT", "WAIT"], index=0,
         )
     with fcols[2]:
         resolution_filter = st.selectbox(
-            "Resolution",
-            options=["ALL", "OPEN", "RESOLVED_TP", "RESOLVED_SL"],
-            index=0,
+            t("filter_resolution"),
+            options=["ALL", "OPEN", "RESOLVED_TP", "RESOLVED_SL"], index=0,
         )
 
     rows = signals
@@ -655,56 +833,50 @@ def render_signals_tab(signals: list[dict]) -> None:
         rows = [s for s in rows if _resolution_status(s) == resolution_filter]
 
     if not rows:
-        st.info("No signals match the current filter.")
+        st.info(t("no_signals"))
         return
 
-    # Decorate each row with resolution badge + theoretical PnL (if resolved)
     enriched = []
     for s in rows:
         res = _signal_resolution(s)
-        enriched.append(
-            {
-                **s,
-                "resolution": _resolution_status(s),
-                "theoretical_pnl_usd": (res or {}).get("theoretical_pnl_usd"),
-                "exit_price": (res or {}).get("exit_price"),
-            }
-        )
-
+        enriched.append({
+            **s,
+            "resolution": _resolution_status(s),
+            "theoretical_pnl_usd": (res or {}).get("theoretical_pnl_usd"),
+            "exit_price": (res or {}).get("exit_price"),
+        })
     df = pd.DataFrame(enriched)
     df["created_at"] = pd.to_datetime(df["created_at"]).dt.strftime("%Y-%m-%d %H:%M")
-    cols_to_show = [
+    cols = [
         "created_at", "market", "term", "symbol", "action", "resolution",
         "confidence", "entry", "tp", "sl", "exit_price", "rr",
-        "theoretical_pnl_usd", "risk_usd", "quant_score", "sentiment_score",
-        "macro_regime",
-    ]
-    cols_to_show = [c for c in cols_to_show if c in df.columns]
-    st.dataframe(df[cols_to_show], use_container_width=True, hide_index=True)
-
-
-def render_trades_tab(trades: list[dict]) -> None:
-    st.markdown("### 🪙 Executed Crypto Trades (last 90 days)")
-    if not trades:
-        st.info("No trades executed yet — Crypto must be in AUTO_BOT mode.")
-        return
-
-    df = pd.DataFrame(trades)
-    df["created_at"] = pd.to_datetime(df["created_at"]).dt.strftime("%Y-%m-%d %H:%M")
-    if "closed_at" in df.columns:
-        df["closed_at"] = pd.to_datetime(df["closed_at"]).dt.strftime("%Y-%m-%d %H:%M")
-    cols = [
-        "created_at", "closed_at", "symbol", "side", "entry", "tp", "sl",
-        "qty", "leverage", "status", "realized_pnl_usd", "client_order_id",
+        "theoretical_pnl_usd", "risk_usd",
     ]
     cols = [c for c in cols if c in df.columns]
     st.dataframe(df[cols], use_container_width=True, hide_index=True)
 
 
-def render_latest_decision_tab(decisions: dict[str, dict], prices: dict[str, float | None]) -> None:
-    st.markdown("### 🧠 Latest Decisions per Symbol")
+def render_trades_tab(trades: list[dict]) -> None:
+    st.markdown(t("tab_trades_title"))
+    if not trades:
+        st.info(t("no_trades"))
+        return
+    df = pd.DataFrame(trades)
+    df["created_at"] = pd.to_datetime(df["created_at"]).dt.strftime("%Y-%m-%d %H:%M")
+    if "closed_at" in df.columns:
+        df["closed_at"] = pd.to_datetime(df["closed_at"]).dt.strftime("%Y-%m-%d %H:%M")
+    cols = ["created_at", "closed_at", "symbol", "side", "entry", "tp", "sl",
+            "qty", "leverage", "status", "realized_pnl_usd", "client_order_id"]
+    cols = [c for c in cols if c in df.columns]
+    st.dataframe(df[cols], use_container_width=True, hide_index=True)
+
+
+def render_decisions_tab(
+    decisions: dict[str, dict], prices: dict[str, float | None]
+) -> None:
+    st.markdown(t("tab_decisions_title"))
     if not decisions:
-        st.info("No decisions cached in Redis yet — wait for the first scheduler tick.")
+        st.info(t("no_decisions"))
         return
 
     items = sorted(
@@ -722,205 +894,96 @@ def render_latest_decision_tab(decisions: dict[str, dict], prices: dict[str, flo
         produced = bundle.get("produced_at", "")
         price = prices.get(symbol)
         pending = bundle.get("pending_order")
+        source = d.get("source") or bundle.get("decision", {}).get("source") or "?"
 
         color = {
             "LONG": "🟢", "SHORT": "🔴", "WAIT": "🟡", "CANCEL_PENDING": "🟣",
         }.get(action, "⚪")
+        source_badge = t("source_ai") if source == "ai_verified" else t("source_rule")
         header = (
             f"{color} {symbol} · {market} · {term} · {action} "
-            f"({int(confidence)}%) · {produced[:16]}"
+            f"({int(confidence)}%) · {source_badge} · {produced[:16]}"
         )
         if pending:
-            header += " · 📌 pending order on book"
+            header += " · 📌"
 
-        with st.expander(header, expanded=(action not in ("WAIT", "CANCEL_PENDING"))):
+        with st.expander(
+            header, expanded=(action not in ("WAIT", "CANCEL_PENDING"))
+        ):
             top = st.columns([2, 1])
             with top[0]:
                 st.markdown(
-                    f"**Justification:** {d.get('justification') or d.get('rationale') or '—'}"
+                    f"**{t('justification')}:** "
+                    f"{d.get('justification') or d.get('rationale') or '—'}"
                 )
                 if d.get("chart_observations"):
-                    st.markdown("**Chart observations:**")
+                    st.markdown(f"**{t('chart_obs')}:**")
                     for obs in d["chart_observations"]:
                         st.markdown(f"- {obs}")
                 if d.get("rulebook_references"):
                     st.markdown(
-                        "**Rulebook refs:** " + ", ".join(d["rulebook_references"])
+                        f"**{t('rule_refs')}:** " + ", ".join(d["rulebook_references"])
                     )
                 if d.get("conflict_flags"):
-                    st.warning("Conflict flags: " + ", ".join(d["conflict_flags"]))
-                if action == "CANCEL_PENDING" and d.get("cancel_target_client_id"):
-                    st.error(
-                        f"🛑 AI canceled pending order: "
-                        f"`{d['cancel_target_client_id']}`"
-                    )
-                if pending:
-                    st.info(
-                        f"📌 Pending {pending.get('side')} order resting at "
-                        f"${pending.get('entry_price'):,.2f} "
-                        f"(age: {pending.get('age_hours', 0):.1f}h, "
-                        f"trade #{pending.get('trade_id')})"
-                    )
+                    st.warning(f"{t('conflict')}: " + ", ".join(d["conflict_flags"]))
 
             with top[1]:
-                st.metric("Live Price", f"{price:,.2f}" if price else "—")
+                st.metric(t("live_price"), f"{price:,.2f}" if price else "—")
                 if action in ("LONG", "SHORT"):
-                    st.metric("Entry", f"{d.get('entry_price') or d.get('entry'):,.2f}")
-                    st.metric("Take-Profit", f"{d.get('take_profit'):,.2f}")
-                    st.metric("Stop-Loss", f"{d.get('stop_loss'):,.2f}")
+                    st.metric(t("entry"), f"{d.get('entry_price') or d.get('entry'):,.2f}")
+                    st.metric(t("tp"), f"{d.get('take_profit'):,.2f}")
+                    st.metric(t("sl"), f"{d.get('stop_loss'):,.2f}")
                     st.caption(
-                        f"R:R {d.get('reward_risk_ratio', 0):.2f} · "
-                        f"Risk ${d.get('risk_usd', 0):,.2f} · "
-                        f"Lev {d.get('leverage', 1)}x"
+                        f"{t('rr')} {d.get('reward_risk_ratio', 0):.2f} · "
+                        f"{t('risk')} ${d.get('risk_usd', 0):,.2f} · "
+                        f"{t('lev')} {d.get('leverage', 1)}x"
                     )
 
             sub = st.columns(3)
             with sub[0]:
-                if st.button("📋 Full decision JSON", key=f"json:{symbol}"):
+                if st.button(t("view_full_json"), key=f"json:{symbol}"):
                     st.code(json.dumps(d, indent=2, default=str), language="json")
             with sub[1]:
-                if st.button("📊 Quant report", key=f"quant:{symbol}"):
-                    st.json(bundle.get("quant"))
+                if st.button(t("view_quant"), key=f"quant:{symbol}"):
+                    st.json(bundle.get("quant") or {"info": "rule-only cycle (no AI)"})
             with sub[2]:
-                if st.button("📰 Sentiment report", key=f"sent:{symbol}"):
-                    st.json(bundle.get("sentiment"))
+                if st.button(t("view_sentiment"), key=f"sent:{symbol}"):
+                    st.json(bundle.get("sentiment") or {"info": "rule-only cycle (no AI)"})
 
 
-# ============================================================================
-# LLM cost aggregation + rendering
-# ============================================================================
-
-def compute_today_cost(cost_logs: list[dict[str, Any]]) -> dict[str, Any]:
-    """Roll up the cost logs that fall inside the current UTC day.
-
-    Returns:
-        {
-          "n_calls":           int,
-          "total_cost_usd":    float,
-          "total_input":       int,
-          "total_output":      int,
-          "by_agent":          {agent_label: {"n", "cost", "input", "output"}},
-          "by_market":         {market_value: {"n", "cost"}},
-        }
-    """
-    now = datetime.now(timezone.utc)
-    start = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
-
-    todays = [r for r in cost_logs if r["created_at"] >= start]
-
-    by_agent: dict[str, dict[str, Any]] = {}
-    by_market: dict[str, dict[str, Any]] = {}
-
-    total_cost = 0.0
-    total_in = 0
-    total_out = 0
-    for r in todays:
-        cost = float(r["estimated_cost_usd"] or 0.0)
-        in_t = int(r["input_tokens"] or 0)
-        out_t = int(r["output_tokens"] or 0)
-        total_cost += cost
-        total_in += in_t
-        total_out += out_t
-
-        a = by_agent.setdefault(
-            r["agent_label"] or "unknown",
-            {"n": 0, "cost": 0.0, "input": 0, "output": 0},
-        )
-        a["n"] += 1
-        a["cost"] += cost
-        a["input"] += in_t
-        a["output"] += out_t
-
-        if r["market"]:
-            m = by_market.setdefault(
-                r["market"], {"n": 0, "cost": 0.0}
-            )
-            m["n"] += 1
-            m["cost"] += cost
-
-    return {
-        "n_calls": len(todays),
-        "total_cost_usd": total_cost,
-        "total_input": total_in,
-        "total_output": total_out,
-        "by_agent": by_agent,
-        "by_market": by_market,
-    }
-
-
-def render_costs_tab(cost_logs: list[dict[str, Any]]) -> None:
-    st.markdown("### 💰 LLM API Costs (today, UTC)")
-
-    today = compute_today_cost(cost_logs)
-
-    # Today's headline metrics
-    cols = st.columns(4)
-    cols[0].metric("API Calls", today["n_calls"])
-    cols[1].metric("Cost (USD)", f"${today['total_cost_usd']:,.4f}")
-    cols[2].metric("Input Tokens", f"{today['total_input']:,}")
-    cols[3].metric("Output Tokens", f"{today['total_output']:,}")
-
-    # By-agent breakdown — quick read on which agent is burning the budget
-    if today["by_agent"]:
-        st.markdown("#### By agent")
-        rows = [
-            {
-                "Agent": agent,
-                "Calls": stats["n"],
-                "Input tokens": stats["input"],
-                "Output tokens": stats["output"],
-                "Cost (USD)": round(stats["cost"], 4),
-            }
-            for agent, stats in sorted(
-                today["by_agent"].items(),
-                key=lambda kv: kv[1]["cost"],
-                reverse=True,
-            )
-        ]
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-
-    if today["by_market"]:
-        st.markdown("#### By market")
-        rows = [
-            {
-                "Market": market,
-                "Calls": stats["n"],
-                "Cost (USD)": round(stats["cost"], 4),
-            }
-            for market, stats in sorted(
-                today["by_market"].items(),
-                key=lambda kv: kv[1]["cost"],
-                reverse=True,
-            )
-        ]
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-
-    # Raw call log — today's calls newest-first
-    st.markdown("#### Per-call log (today)")
+def render_costs_tab(cost_logs: list[dict]) -> None:
+    st.markdown(t("tab_costs_title"))
     now = datetime.now(timezone.utc)
     start = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
     today_rows = [r for r in cost_logs if r["created_at"] >= start]
+
+    total_cost = sum(r["estimated_cost_usd"] or 0 for r in today_rows)
+    total_in = sum(r["input_tokens"] or 0 for r in today_rows)
+    total_out = sum(r["output_tokens"] or 0 for r in today_rows)
+
+    cols = st.columns(4)
+    cols[0].metric("Calls", len(today_rows))
+    cols[1].metric("USD", f"${total_cost:,.4f}")
+    cols[2].metric("In tokens", f"{total_in:,}")
+    cols[3].metric("Out tokens", f"{total_out:,}")
+
     if not today_rows:
-        st.info("No LLM calls logged yet today.")
-    else:
-        df = pd.DataFrame(today_rows)
-        df["created_at"] = pd.to_datetime(df["created_at"]).dt.strftime("%H:%M:%S")
-        df = df.rename(columns={
-            "created_at": "Time (UTC)",
-            "market": "Market",
-            "symbol": "Symbol",
-            "agent_label": "Agent",
-            "model": "Model",
-            "input_tokens": "In",
-            "output_tokens": "Out",
-            "estimated_cost_usd": "Cost (USD)",
-        })
-        cols_show = [
-            "Time (UTC)", "Market", "Symbol", "Agent", "Model",
-            "In", "Out", "Cost (USD)",
-        ]
-        cols_show = [c for c in cols_show if c in df.columns]
-        st.dataframe(df[cols_show], use_container_width=True, hide_index=True)
+        st.info(t("no_costs"))
+        return
+
+    df = pd.DataFrame(today_rows)
+    df["created_at"] = pd.to_datetime(df["created_at"]).dt.strftime("%H:%M:%S")
+    df = df.rename(columns={
+        "created_at": "Time (UTC)",
+        "market": "Market", "symbol": "Symbol",
+        "agent_label": "Agent", "model": "Model",
+        "input_tokens": "In", "output_tokens": "Out",
+        "estimated_cost_usd": "Cost (USD)",
+    })
+    cols_show = ["Time (UTC)", "Market", "Symbol", "Agent", "Model",
+                 "In", "Out", "Cost (USD)"]
+    cols_show = [c for c in cols_show if c in df.columns]
+    st.dataframe(df[cols_show], use_container_width=True, hide_index=True)
 
 
 # ============================================================================
@@ -928,39 +991,47 @@ def render_costs_tab(cost_logs: list[dict[str, Any]]) -> None:
 # ============================================================================
 
 def main() -> None:
+    if "lang" not in st.session_state:
+        st.session_state["lang"] = "tr"
+
     configs = load_market_configs()
     redis_state = load_redis_state()
     signals = load_signals(days_back=30)
     trades = load_trades(days_back=90)
     cost_logs = load_cost_logs(days_back=7)
 
-    st.title("📈 TradeRay — Global Financial Terminal")
+    st.title(t("app_title"))
     st.caption(
-        f"As of {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')} · "
-        f"Auto-refresh every 30s · "
-        f"Redis: `{settings.redis_url}`"
+        f"{t('as_of')}: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')} · "
+        f"{t('auto_refresh')}"
     )
 
     render_sidebar(configs, redis_state.get("screener_flags", {}))
 
-    # Top KPI strip (6 metrics; "API Cost (today)" sits last because it's
-    # observational rather than position-state)
-    today_cost = compute_today_cost(cost_logs)
-    kpi = st.columns(6)
-    n_active_signals = sum(1 for s in signals if s["action"] != "WAIT")
-    n_resolved_signals = sum(
-        1 for s in signals if _signal_resolution(s) is not None
+    # KPI strip — compact
+    now = datetime.now(timezone.utc)
+    start = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+    today_cost = sum(
+        (r["estimated_cost_usd"] or 0)
+        for r in cost_logs
+        if r["created_at"] >= start
     )
+    n_today_calls = sum(1 for r in cost_logs if r["created_at"] >= start)
+
+    n_active_signals = sum(1 for s in signals if s["action"] != "WAIT")
+    n_resolved = sum(1 for s in signals if _signal_resolution(s) is not None)
     n_open_trades = sum(1 for t in trades if t["status"] in ("PENDING", "OPEN"))
-    kpi[0].metric("Active Markets", sum(1 for c in configs if c["enabled"]))
-    kpi[1].metric("Signals (30d)", len(signals))
-    kpi[2].metric("Non-WAIT", n_active_signals)
-    kpi[3].metric("Resolved", n_resolved_signals)
-    kpi[4].metric("Open Trades", n_open_trades)
+
+    kpi = st.columns(6)
+    kpi[0].metric(t("active_markets"), sum(1 for c in configs if c["enabled"]))
+    kpi[1].metric(t("signals_30d"), len(signals))
+    kpi[2].metric(t("non_wait"), n_active_signals)
+    kpi[3].metric(t("resolved"), n_resolved)
+    kpi[4].metric(t("open_trades"), n_open_trades)
     kpi[5].metric(
-        "Today's API Cost",
-        f"${today_cost['total_cost_usd']:,.2f}",
-        delta=f"{today_cost['n_calls']} calls",
+        t("today_cost"),
+        f"${today_cost:,.2f}",
+        delta=f"{n_today_calls} {t('calls')}",
         delta_color="off",
     )
 
@@ -968,15 +1039,14 @@ def main() -> None:
     render_pnl_matrix(trades, signals, redis_state["prices"])
 
     st.divider()
-    t1, t2, t3, t4 = st.tabs(
-        ["📡 Signals", "🪙 Trades", "🧠 Latest Decisions", "💰 API Costs"]
-    )
+    t1, t2, t3, t4 = st.tabs([t("tab_signals"), t("tab_trades"),
+                              t("tab_decisions"), t("tab_costs")])
     with t1:
         render_signals_tab(signals)
     with t2:
         render_trades_tab(trades)
     with t3:
-        render_latest_decision_tab(redis_state["decisions"], redis_state["prices"])
+        render_decisions_tab(redis_state["decisions"], redis_state["prices"])
     with t4:
         render_costs_tab(cost_logs)
 

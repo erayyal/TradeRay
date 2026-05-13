@@ -190,7 +190,9 @@ class MarketConfig(Base):
     market: Mapped[MarketType] = mapped_column(
         SAEnum(MarketType, native_enum=False), primary_key=True
     )
-    enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    # COLD START defaults — every flag off. User opts in from the dashboard.
+    enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    use_ai: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     term: Mapped[Term] = mapped_column(
         SAEnum(Term, native_enum=False), default=Term.SHORT_TERM, nullable=False
     )
@@ -199,6 +201,8 @@ class MarketConfig(Base):
         default=ExecutionMode.SIGNAL_ONLY,
         nullable=False,
     )
+    # Empty by default — Dynamic Screener supplies symbols per cycle.
+    # The dashboard can override with a comma-separated list to pin specific tickers.
     symbols_csv: Mapped[str] = mapped_column(String(512), default="", nullable=False)
     last_run_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True
@@ -384,27 +388,34 @@ async def session_scope() -> AsyncIterator[AsyncSession]:
             raise
 
 
-async def seed_default_market_config(symbols_by_market: dict[MarketType, list[str]]) -> None:
-    """Insert MarketConfig rows for any markets missing on first boot."""
+async def seed_default_market_config() -> None:
+    """COLD START seeder — one row per MarketType, every flag OFF.
+
+    All MarketConfig rows start with:
+      - enabled=False           : bot doesn't trade this market
+      - use_ai=False            : rule engine drives decisions (zero token cost)
+      - execution_mode=SIGNAL_ONLY : no real orders even if `enabled` flips on
+      - symbols_csv=""          : Dynamic Screener fills the symbol list each cycle
+
+    The user enables exactly what they want from the dashboard sidebar.
+    NO HARDCODED SYMBOLS anywhere — every list is screener-driven.
+    """
     from sqlalchemy import select
 
     async with AsyncSessionLocal() as session:
         existing = (await session.execute(select(MarketConfig.market))).scalars().all()
         existing_set = set(existing)
-        for market, syms in symbols_by_market.items():
+        for market in MarketType:
             if market in existing_set:
                 continue
             session.add(
                 MarketConfig(
                     market=market,
-                    enabled=True,
+                    enabled=False,
+                    use_ai=False,
                     term=Term.SHORT_TERM,
-                    execution_mode=(
-                        ExecutionMode.AUTO_BOT
-                        if market == MarketType.CRYPTO
-                        else ExecutionMode.SIGNAL_ONLY
-                    ),
-                    symbols_csv=",".join(syms),
+                    execution_mode=ExecutionMode.SIGNAL_ONLY,
+                    symbols_csv="",
                 )
             )
         await session.commit()

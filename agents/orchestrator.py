@@ -50,6 +50,7 @@ from agents.prompts import (
     SENTIMENT_SYSTEM_PROMPT,
     build_master_trader_prompt,
 )
+from agents.rule_engine import generate_rule_decision
 from config import settings
 from core.logger import get_logger
 from core.redis_client import cache
@@ -372,6 +373,12 @@ async def _run_master_trader(
     return parsed
 
 
+# Token-economy gate: only render + send the chart when the rule-engine's
+# conviction is high enough that vision-confirmation is worth ~3K extra
+# input tokens. Sub-threshold setups get text-only Master Trader calls.
+_VISION_CONFIDENCE_THRESHOLD: int = 70
+
+
 # ---------------------------------------------------------------------------
 # Per-symbol cycle
 # ---------------------------------------------------------------------------
@@ -382,9 +389,22 @@ async def run_symbol_cycle(
     market: MarketType,
     term: Term,
     execution_mode: ExecutionMode,
+    use_ai: bool,
     macro_context: dict[str, Any],
 ) -> dict[str, Any] | None:
-    """End-to-end pipeline for one symbol."""
+    """Dual-core symbol cycle: rule engine first, LLM only when there's a setup
+    AND the user has explicitly opted in to AI verification.
+
+    Flow:
+      1. Fetch OHLCV (free).
+      2. Compute indicators (free).
+      3. Rule engine → LONG / SHORT / WAIT (free, deterministic).
+      4. If WAIT → route as-is, zero LLM cost, zero tokens.
+      5. If setup found AND use_ai=False → route the rule decision as-is.
+      6. If setup found AND use_ai=True → call Quant + Sentiment + Master to
+         verify/refine. Chart is rendered only when the rule engine's
+         confidence ≥ 70 (token-economy gate).
+    """
     primary_iv = PRIMARY_INTERVAL[term]
 
     # 1. OHLCV bundle
@@ -398,77 +418,131 @@ async def run_symbol_cycle(
         )
         return None
 
-    # 2. Quant + Sentiment in parallel
-    quant_task = asyncio.create_task(
-        _safe(f"quant:{symbol}", _run_quant(
-            symbol=symbol, market=market, term=term, ohlcv_by_interval=ohlcv,
-        ))
-    )
-    sent_task = asyncio.create_task(
-        _safe(
-            f"sentiment:{symbol}",
-            _run_sentiment(macro_context, market=market, symbol=symbol),
-        )
-    )
-    quant, sentiment = await asyncio.gather(quant_task, sent_task)
-
-    if quant is None or sentiment is None:
-        log.warning(
-            "orchestrator.agent_missing",
-            symbol=symbol, quant_ok=quant is not None, sentiment_ok=sentiment is not None,
-        )
+    # 2. Compute indicators per interval with the right lookbacks
+    indicators = {
+        iv: compute_indicators(c, lookbacks=lookbacks_for(iv))
+        for iv, c in ohlcv.items()
+        if c
+    }
+    if not indicators:
+        log.warning("orchestrator.no_indicators", symbol=symbol)
         return None
 
-    # 3. Render the chart on the primary interval (off-thread; matplotlib blocks).
-    primary_candles = ohlcv.get(primary_iv) or []
-    chart_b64 = await asyncio.to_thread(
-        render_chart_base64, primary_candles, symbol=symbol, interval=primary_iv,
-    )
-
-    # 4. Look up any UNFILLED limit order resting for this symbol.
+    # 3. Pending-order lookup (need it for cache + master prompt)
     pending_order = await _safe(
         f"pending_lookup:{symbol}",
         get_pending_trade_for_symbol(symbol),
     )
 
-    # 4b. Market-specific microstructure (closes the data blindspot the
-    # rulebooks reference: funding/OI for crypto, USDTRY for BIST).
-    microstructure = await _fetch_microstructure(symbol, market)
-
-    # 5. Master Trader fuses everything (with pending order + microstructure).
-    decision = await _safe(
-        f"master:{symbol}",
-        _run_master_trader(
-            symbol=symbol,
-            market=market,
-            term=term,
-            primary_interval=primary_iv,
-            quant=quant,
-            sentiment=sentiment,
-            chart_b64=chart_b64,
-            execution_mode=execution_mode,
-            pending_order=pending_order,
-            microstructure=microstructure,
-        ),
+    # 4. Rule engine — deterministic, free
+    rule_decision = generate_rule_decision(
+        symbol=symbol, market=market, term=term,
+        primary_interval=primary_iv, indicators=indicators,
     )
-    if decision is None:
-        return None
-    decision = _normalize_decision(decision)
 
-    # 6. Cache the full bundle for the UI (regardless of branch below)
+    # Track the path we took for cost-attribution and dashboard observability
+    decision_source = "rule_engine"
+    quant: dict[str, Any] | None = None
+    sentiment: dict[str, Any] | None = None
+    microstructure: dict[str, Any] = {}
+    chart_b64: str | None = None
+
+    if rule_decision["decision"] == "WAIT":
+        # No setup — short-circuit. ZERO LLM cost in this branch (dominant case).
+        log.info(
+            "orchestrator.no_setup_wait", symbol=symbol, market=market.value,
+            use_ai=use_ai,
+        )
+        final_decision = rule_decision
+
+    elif not use_ai:
+        # Setup found, but AI is OFF for this market — rule decision is final.
+        # Pure-algorithm mode: still ZERO LLM cost.
+        log.info(
+            "orchestrator.rule_only_setup", symbol=symbol, market=market.value,
+            direction=rule_decision["decision"],
+            confidence=rule_decision["confidence_level"],
+        )
+        final_decision = rule_decision
+
+    else:
+        # Setup + use_ai=True — invoke the LLM verification pipeline.
+        decision_source = "ai_verified"
+
+        # Quant + Sentiment in parallel
+        quant_task = asyncio.create_task(
+            _safe(f"quant:{symbol}", _run_quant(
+                symbol=symbol, market=market, term=term,
+                ohlcv_by_interval=ohlcv,
+            ))
+        )
+        sent_task = asyncio.create_task(
+            _safe(
+                f"sentiment:{symbol}",
+                _run_sentiment(macro_context, market=market, symbol=symbol),
+            )
+        )
+        quant, sentiment = await asyncio.gather(quant_task, sent_task)
+        if quant is None or sentiment is None:
+            log.warning(
+                "orchestrator.agent_missing_fallback_to_rule",
+                symbol=symbol, quant_ok=quant is not None,
+                sentiment_ok=sentiment is not None,
+            )
+            # Fail safe to rule decision rather than burning more tokens on retry
+            final_decision = rule_decision
+        else:
+            # Chart only on high-confidence setups (token-economy gate)
+            primary_candles = ohlcv.get(primary_iv) or []
+            if rule_decision["confidence_level"] >= _VISION_CONFIDENCE_THRESHOLD:
+                chart_b64 = await asyncio.to_thread(
+                    render_chart_base64,
+                    primary_candles, symbol=symbol, interval=primary_iv,
+                )
+
+            microstructure = await _fetch_microstructure(symbol, market)
+
+            master_decision = await _safe(
+                f"master:{symbol}",
+                _run_master_trader(
+                    symbol=symbol, market=market, term=term,
+                    primary_interval=primary_iv,
+                    quant=quant, sentiment=sentiment,
+                    chart_b64=chart_b64,
+                    execution_mode=execution_mode,
+                    pending_order=pending_order,
+                    microstructure=microstructure,
+                ),
+            )
+            if master_decision is None:
+                # Master failed — fall back to the rule engine's setup
+                log.warning(
+                    "orchestrator.master_failed_fallback_to_rule", symbol=symbol,
+                )
+                final_decision = rule_decision
+            else:
+                final_decision = _normalize_decision(master_decision)
+
+    # 5. Tag and persist the final decision for the UI
+    final_decision["source"] = decision_source
+
     bundle = {
         "symbol": symbol,
         "market": market.value,
         "term": term.value,
         "execution_mode": execution_mode.value,
-        "quant": quant,
-        "sentiment": sentiment,
+        "use_ai": use_ai,
+        "rule_decision": rule_decision,  # always present
+        "quant": quant,                  # null when use_ai=False
+        "sentiment": sentiment,          # null when use_ai=False
         "microstructure": microstructure,
         "pending_order": pending_order,
-        "decision": decision,
+        "decision": final_decision,
         "produced_at": datetime.now(timezone.utc).isoformat(),
     }
     await cache.set_json(f"decision:{symbol}:latest", bundle, ttl=3600)
+
+    decision = final_decision  # downstream branches use this name
 
     action = decision.get("decision")
 
@@ -513,10 +587,10 @@ async def run_symbol_cycle(
             symbol=symbol,
             decision=decision,
             mode=execution_mode,
-            quant_score=quant.get("quant_score"),
-            sentiment_score=sentiment.get("sentiment_score"),
-            fear_greed_index=sentiment.get("fear_greed_index"),
-            macro_regime=sentiment.get("macro_regime"),
+            quant_score=(quant or {}).get("quant_score"),
+            sentiment_score=(sentiment or {}).get("sentiment_score"),
+            fear_greed_index=(sentiment or {}).get("fear_greed_index"),
+            macro_regime=(sentiment or {}).get("macro_regime"),
         ),
     )
 
@@ -606,8 +680,12 @@ async def run_market_cycle(market_config: MarketConfig) -> None:
         symbols=symbols,
     )
 
-    # Macro context: fetched ONCE, reused across all symbols this cycle.
-    macro_context = await _refresh_macro_context()
+    # Macro context — only fetched when this market actually uses AI.
+    # In rule-only mode (use_ai=False) we save the HTTP calls to RSS/FRED/
+    # DefiLlama AND prevent the Sentiment LLM from running entirely.
+    macro_context: dict[str, Any] = {}
+    if market_config.use_ai:
+        macro_context = await _refresh_macro_context()
 
     n_executed = 0
     n_signaled = 0
@@ -619,6 +697,7 @@ async def run_market_cycle(market_config: MarketConfig) -> None:
                 market=market_config.market,
                 term=market_config.term,
                 execution_mode=market_config.execution_mode,
+                use_ai=market_config.use_ai,
                 macro_context=macro_context,
             )
             if result:
