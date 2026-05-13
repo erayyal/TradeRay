@@ -34,6 +34,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+from sqlalchemy.pool import NullPool
 
 
 # ---------------------------------------------------------------------------
@@ -315,6 +316,24 @@ elif _IS_POSTGRES:
         "statement_cache_size": 0,
         "prepared_statement_cache_size": 0,
     }
+
+# NullPool for Streamlit / short-lived async clients.
+#
+# Streamlit calls `asyncio.run(coro)` on every script rerun, which creates
+# a fresh event loop each time. SQLAlchemy's default pool keeps asyncpg
+# connections alive across calls — those connections are bound to the
+# FIRST loop and explode with "Future attached to a different loop" the
+# next time Streamlit reruns.
+#
+# NullPool opens a brand-new connection per checkout and closes it on
+# release — every connection lives entirely inside the one asyncio.run
+# loop that created it. Slight overhead, but dashboards are low-traffic
+# (1 user, 30s auto-refresh) so it's invisible in practice.
+#
+# Backend uses the default pool because main.py runs ONE persistent loop.
+if os.getenv("SQLA_DISABLE_POOL", "false").lower() == "true":
+    _engine_kwargs["poolclass"] = NullPool
+    _engine_kwargs.pop("pool_pre_ping", None)  # NullPool has no ping concept
 
 _engine = create_async_engine(DATABASE_URL, **_engine_kwargs)
 

@@ -94,6 +94,10 @@ services:
       # Streamlit only adds the script's directory (/app/ui) to sys.path —
       # set PYTHONPATH so `from config import settings` (a sibling dir) works.
       PYTHONPATH: "/app"
+      # Streamlit creates a fresh asyncio loop per script rerun; the default
+      # SQLAlchemy pool would reuse asyncpg connections bound to dead loops.
+      # NullPool: open + close per call, no cross-loop leak.
+      SQLA_DISABLE_POOL: "true"
     networks:
       - traderay_net
     depends_on:
