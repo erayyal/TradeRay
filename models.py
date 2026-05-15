@@ -73,6 +73,26 @@ class TradeStatus(str, enum.Enum):
     REJECTED = "REJECTED"   # blocked by risk manager
 
 
+# --- Audit trail enums ----------------------------------------------------
+
+class AuditCategory(str, enum.Enum):
+    BOT = "BOT"        # Crypto AUTO_BOT — real orders attempted
+    SIGNAL = "SIGNAL"  # Signal-only path (incl. coerced traditional markets)
+
+
+class AuditMode(str, enum.Enum):
+    AI_ENABLED = "AI_ENABLED"
+    RULE_BASED_ONLY = "RULE_BASED_ONLY"
+
+
+class AuditOutcome(str, enum.Enum):
+    EXECUTED    = "EXECUTED"     # Order actually placed on exchange
+    SIGNAL_SENT = "SIGNAL_SENT"  # Signal logged, no order (signal-only mode)
+    WAITED      = "WAITED"       # Decision = WAIT, no action taken
+    REJECTED    = "REJECTED"     # Risk / filter / TP_SL gate rejected
+    ERROR       = "ERROR"        # Exception in the cycle pipeline
+
+
 # ---------------------------------------------------------------------------
 # Base
 # ---------------------------------------------------------------------------
@@ -267,6 +287,72 @@ class LLMCostLog(Base):
 
 
 # ---------------------------------------------------------------------------
+# DecisionAudit — full transparency log of EVERY symbol cycle outcome.
+#
+# One row per `run_symbol_cycle` exit, regardless of branch (executed,
+# signal-only, waited, rejected, error). The `logic_trace` JSON field
+# captures the full reasoning at every stage — indicators, rule-engine
+# verdict, AI analysis (when use_ai=True), validation results, execution
+# metadata. The dashboard's "Decision Trace" tab reads this directly.
+#
+# Why a separate table from `signals`?
+#   - `signals` row only exists when a non-WAIT decision was made AND
+#     passed the strict TP/SL gate. Audit MUST also capture WAITs and
+#     pre-persistence rejections.
+#   - Audit is observational + immutable; signals are operational state.
+# ---------------------------------------------------------------------------
+
+class DecisionAudit(Base):
+    __tablename__ = "decision_audits"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+        index=True,
+    )
+
+    category: Mapped[AuditCategory] = mapped_column(
+        SAEnum(AuditCategory, native_enum=False), nullable=False, index=True,
+    )
+    market: Mapped[MarketType] = mapped_column(
+        SAEnum(MarketType, native_enum=False), nullable=False, index=True,
+    )
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    mode: Mapped[AuditMode] = mapped_column(
+        SAEnum(AuditMode, native_enum=False), nullable=False, index=True,
+    )
+    outcome: Mapped[AuditOutcome] = mapped_column(
+        SAEnum(AuditOutcome, native_enum=False), nullable=False, index=True,
+    )
+
+    # JSON trace of the full reasoning path. Shape (all keys optional):
+    #   {
+    #     "indicators":   { rsi, macd_hist, ema_slow, atr, last_close, ... },
+    #     "rule_engine":  { decision, confidence, justification, tp, sl },
+    #     "ai_analysis":  null OR {
+    #         "quant_report": {...}, "sentiment_report": {...},
+    #         "master_decision": {...},   # raw Master Trader JSON, untruncated
+    #     },
+    #     "validation":   { entry, tp, sl, rr, risk_usd, gates_passed: [...] },
+    #     "execution":    { mode_requested, mode_applied, executed,
+    #                        trade_id, signal_id, route_reason }
+    #   }
+    logic_trace: Mapped[dict[str, Any]] = mapped_column(
+        JSON, default=dict, nullable=False
+    )
+
+    reason: Mapped[str] = mapped_column(String(512), nullable=False, default="")
+
+    __table_args__ = (
+        Index("ix_audit_created_outcome", "created_at", "outcome"),
+        Index("ix_audit_market_symbol", "market", "symbol"),
+        Index("ix_audit_category_mode", "category", "mode"),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Engine + session factory + helpers
 # ---------------------------------------------------------------------------
 
@@ -388,6 +474,41 @@ async def session_scope() -> AsyncIterator[AsyncSession]:
             raise
 
 
+async def log_decision_audit(
+    *,
+    category: AuditCategory,
+    market: MarketType,
+    symbol: str,
+    mode: AuditMode,
+    outcome: AuditOutcome,
+    logic_trace: dict[str, Any],
+    reason: str,
+) -> None:
+    """Persist one DecisionAudit row. Best-effort — never raises.
+
+    Audit logging MUST NOT break the trading cycle. Any failure here is
+    swallowed and logged at WARNING — the next cycle still runs.
+    """
+    try:
+        async with AsyncSessionLocal() as session:
+            session.add(
+                DecisionAudit(
+                    category=category,
+                    market=market,
+                    symbol=symbol,
+                    mode=mode,
+                    outcome=outcome,
+                    logic_trace=logic_trace,
+                    reason=(reason or "")[:512],
+                )
+            )
+            await session.commit()
+    except Exception as e:
+        # Lazy logger import to avoid circular dep at module top
+        from core.logger import get_logger
+        get_logger(__name__).warning("audit.log_failed", err=str(e))
+
+
 async def seed_default_market_config() -> None:
     """COLD START seeder — one row per MarketType, every flag OFF.
 
@@ -428,14 +549,19 @@ __all__ = [
     "Term",
     "SignalAction",
     "TradeStatus",
+    "AuditCategory",
+    "AuditMode",
+    "AuditOutcome",
     "Signal",
     "Trade",
     "MarketConfig",
     "LLMCostLog",
+    "DecisionAudit",
     "AsyncSessionLocal",
     "get_engine",
     "init_db",
     "session_scope",
     "seed_default_market_config",
+    "log_decision_audit",
     "DATABASE_URL",
 ]

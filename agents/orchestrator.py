@@ -66,11 +66,15 @@ from execution.tracker import (
 )
 from models import (
     AsyncSessionLocal,
+    AuditCategory,
+    AuditMode,
+    AuditOutcome,
     ExecutionMode,
     LLMCostLog,
     MarketConfig,
     MarketType,
     Term,
+    log_decision_audit,
 )
 from vision_utils import build_vision_message, render_chart_base64
 
@@ -380,6 +384,112 @@ _VISION_CONFIDENCE_THRESHOLD: int = 70
 
 
 # ---------------------------------------------------------------------------
+# Audit trail — full transparency log of every cycle's reasoning
+# ---------------------------------------------------------------------------
+
+def _extract_indicator_snapshot(
+    indicators: dict[str, dict], primary_iv: str
+) -> dict[str, Any]:
+    """Pick the headline numbers from the indicator bundle for the audit row."""
+    primary = indicators.get(primary_iv) or {}
+    return {
+        "primary_interval": primary_iv,
+        "intervals_used": list(indicators.keys()),
+        "rsi": primary.get("rsi"),
+        "macd": primary.get("macd"),
+        "macd_hist": primary.get("macd_hist"),
+        "macd_signal": primary.get("macd_signal"),
+        "ema_fast": primary.get("ema_fast"),
+        "ema_slow": primary.get("ema_slow"),
+        "atr": primary.get("atr"),
+        "atr_pct": primary.get("atr_pct"),
+        "last_close": primary.get("last_close"),
+        "above_ema_slow": primary.get("above_ema_slow"),
+        "bb_position": primary.get("bb_position"),
+    }
+
+
+def _classify_audit(
+    *,
+    decision: dict[str, Any],
+    result: dict[str, Any] | None,
+    use_ai: bool,
+    execution_mode: ExecutionMode,
+) -> tuple[AuditCategory, AuditMode, AuditOutcome, str]:
+    """Map the run_symbol_cycle output to a clean audit record."""
+    mode_enum = AuditMode.AI_ENABLED if use_ai else AuditMode.RULE_BASED_ONLY
+
+    # Category — BOT iff a real exchange order actually went out.
+    # Failed attempts (rejected/error) on the AUTO_BOT path stay as SIGNAL.
+    if result and result.get("executed"):
+        category = AuditCategory.BOT
+    elif execution_mode == ExecutionMode.AUTO_BOT and result and result.get("executed"):
+        category = AuditCategory.BOT
+    else:
+        category = AuditCategory.SIGNAL
+
+    action = (decision or {}).get("decision", "WAIT")
+
+    if result is None:
+        return category, mode_enum, AuditOutcome.ERROR, "no result from cycle (early exit)"
+
+    if result.get("executed"):
+        return (
+            AuditCategory.BOT, mode_enum, AuditOutcome.EXECUTED,
+            f"Order placed: trade_id={result.get('trade_id')}",
+        )
+
+    reason = (result.get("reason") or "").lower()
+    just = (decision or {}).get("justification") or ""
+
+    if action == "WAIT" or reason == "decision_wait":
+        return category, mode_enum, AuditOutcome.WAITED, just[:240] or "no setup"
+
+    if "signal_only" in reason:
+        return category, mode_enum, AuditOutcome.SIGNAL_SENT, just[:240] or "signal logged"
+
+    if "rejected" in reason or "rejected_missing_tp_sl" in reason or "risk_rejected" in reason:
+        return category, mode_enum, AuditOutcome.REJECTED, result.get("reason") or "rejected"
+
+    if "ai_canceled_pending" in reason:
+        return category, mode_enum, AuditOutcome.REJECTED, "AI invalidated pending order"
+
+    if "error" in reason or "executor_returned_none" in reason:
+        return category, mode_enum, AuditOutcome.ERROR, result.get("reason") or "error"
+
+    # Defensive default — unknown route() outcome
+    return category, mode_enum, AuditOutcome.WAITED, result.get("reason") or "unknown"
+
+
+async def _persist_audit(
+    *,
+    market: MarketType,
+    symbol: str,
+    use_ai: bool,
+    execution_mode: ExecutionMode,
+    trace: dict[str, Any],
+    decision: dict[str, Any] | None,
+    result: dict[str, Any] | None,
+) -> None:
+    """Build the audit row from the in-flight trace + final result, then write it."""
+    category, mode_enum, outcome, reason = _classify_audit(
+        decision=decision or {},
+        result=result,
+        use_ai=use_ai,
+        execution_mode=execution_mode,
+    )
+    await log_decision_audit(
+        category=category,
+        market=market,
+        symbol=symbol,
+        mode=mode_enum,
+        outcome=outcome,
+        logic_trace=trace,
+        reason=reason,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Per-symbol cycle
 # ---------------------------------------------------------------------------
 
@@ -404,8 +514,19 @@ async def run_symbol_cycle(
       6. If setup found AND use_ai=True → call Quant + Sentiment + Master to
          verify/refine. Chart is rendered only when the rule engine's
          confidence ≥ 70 (token-economy gate).
+
+    Every exit path writes ONE DecisionAudit row capturing the full trace.
     """
     primary_iv = PRIMARY_INTERVAL[term]
+
+    # Audit trace accumulator — every branch populates what's relevant.
+    trace: dict[str, Any] = {
+        "indicators": {},
+        "rule_engine": {},
+        "ai_analysis": None,
+        "validation": {},
+        "execution": {},
+    }
 
     # 1. OHLCV bundle
     ohlcv = await _safe(
@@ -415,6 +536,13 @@ async def run_symbol_cycle(
     if not ohlcv or not any(ohlcv.values()):
         log.warning(
             "orchestrator.no_ohlcv", symbol=symbol, market=market.value, term=term.value,
+        )
+        trace["execution"]["early_exit"] = "no_ohlcv"
+        await _persist_audit(
+            market=market, symbol=symbol, use_ai=use_ai,
+            execution_mode=execution_mode, trace=trace,
+            decision=None,
+            result={"executed": False, "reason": "error_no_ohlcv"},
         )
         return None
 
@@ -426,7 +554,17 @@ async def run_symbol_cycle(
     }
     if not indicators:
         log.warning("orchestrator.no_indicators", symbol=symbol)
+        trace["execution"]["early_exit"] = "no_indicators"
+        await _persist_audit(
+            market=market, symbol=symbol, use_ai=use_ai,
+            execution_mode=execution_mode, trace=trace,
+            decision=None,
+            result={"executed": False, "reason": "error_no_indicators"},
+        )
         return None
+
+    # Snapshot indicators for the audit row
+    trace["indicators"] = _extract_indicator_snapshot(indicators, primary_iv)
 
     # 3. Pending-order lookup (need it for cache + master prompt)
     pending_order = await _safe(
@@ -439,6 +577,15 @@ async def run_symbol_cycle(
         symbol=symbol, market=market, term=term,
         primary_interval=primary_iv, indicators=indicators,
     )
+    trace["rule_engine"] = {
+        "decision": rule_decision["decision"],
+        "confidence": rule_decision["confidence_level"],
+        "justification": rule_decision["justification"],
+        "entry": rule_decision.get("entry_price"),
+        "tp": rule_decision.get("take_profit"),
+        "sl": rule_decision.get("stop_loss"),
+        "rr": rule_decision.get("reward_risk_ratio"),
+    }
 
     # Track the path we took for cost-attribution and dashboard observability
     decision_source = "rule_engine"
@@ -514,6 +661,19 @@ async def run_symbol_cycle(
                     microstructure=microstructure,
                 ),
             )
+
+            # Audit: record the FULL raw outputs of each LLM agent (untruncated).
+            # `master_decision` is the JSON Master Trader emitted — including
+            # its `justification` field which is the AI's nihai karar cümlesi.
+            trace["ai_analysis"] = {
+                "vision_chart_attached": chart_b64 is not None,
+                "vision_threshold": _VISION_CONFIDENCE_THRESHOLD,
+                "quant_report": quant,
+                "sentiment_report": sentiment,
+                "microstructure": microstructure,
+                "master_decision": master_decision,
+            }
+
             if master_decision is None:
                 # Master failed — fall back to the rule engine's setup
                 log.warning(
@@ -546,52 +706,94 @@ async def run_symbol_cycle(
 
     action = decision.get("decision")
 
+    # Pre-route trace: validation snapshot derived from the final decision.
+    trace["validation"] = {
+        "decision": action,
+        "entry": decision.get("entry") or decision.get("entry_price"),
+        "take_profit": decision.get("take_profit"),
+        "stop_loss": decision.get("stop_loss"),
+        "reward_risk_ratio": decision.get("reward_risk_ratio"),
+        "risk_usd": decision.get("risk_usd"),
+        "leverage": decision.get("leverage"),
+        "confidence_level": decision.get("confidence_level"),
+        "has_complete_plan": all([
+            (decision.get("entry") or decision.get("entry_price")) is not None,
+            decision.get("take_profit") is not None,
+            decision.get("stop_loss") is not None,
+        ]),
+    }
+
+    result: dict[str, Any] | None
+
     # 7a. CANCEL_PENDING — Layer 2 of the staleness manager (AI-driven).
     if action == "CANCEL_PENDING":
         if not pending_order:
             log.warning(
                 "orchestrator.cancel_pending_invalid_no_order", symbol=symbol,
             )
-            # Treat as WAIT so we don't surprise downstream consumers
-            return {
+            result = {
                 "signal_id": None,
                 "trade_id": None,
                 "executed": False,
                 "effective_mode": execution_mode,
                 "reason": "cancel_pending_invalid",
             }
-        canceled_n = await _safe(
-            f"cancel_pending:{symbol}",
-            cancel_pending_for_symbol(symbol, reason="ai_invalidated_thesis"),
-        ) or 0
-        log.info(
-            "orchestrator.cancel_pending_done",
-            symbol=symbol, trade_id=pending_order["trade_id"], canceled=canceled_n,
-            justification=(decision.get("justification") or "")[:200],
+        else:
+            canceled_n = await _safe(
+                f"cancel_pending:{symbol}",
+                cancel_pending_for_symbol(symbol, reason="ai_invalidated_thesis"),
+            ) or 0
+            log.info(
+                "orchestrator.cancel_pending_done",
+                symbol=symbol, trade_id=pending_order["trade_id"], canceled=canceled_n,
+                justification=(decision.get("justification") or "")[:200],
+            )
+            result = {
+                "signal_id": None,
+                "trade_id": pending_order["trade_id"],
+                "executed": False,
+                "effective_mode": execution_mode,
+                "reason": "ai_canceled_pending",
+                "canceled_count": canceled_n,
+            }
+    else:
+        # 7b. Standard path — route LONG/SHORT/WAIT through the engine.
+        result = await _safe(
+            f"engine.route:{symbol}",
+            engine.route(
+                market=market,
+                term=term,
+                symbol=symbol,
+                decision=decision,
+                mode=execution_mode,
+                quant_score=(quant or {}).get("quant_score"),
+                sentiment_score=(sentiment or {}).get("sentiment_score"),
+                fear_greed_index=(sentiment or {}).get("fear_greed_index"),
+                macro_regime=(sentiment or {}).get("macro_regime"),
+            ),
         )
-        return {
-            "signal_id": None,
-            "trade_id": pending_order["trade_id"],
-            "executed": False,
-            "effective_mode": execution_mode,
-            "reason": "ai_canceled_pending",
-            "canceled_count": canceled_n,
-        }
 
-    # 7b. Standard path — route LONG/SHORT/WAIT through the engine.
-    result = await _safe(
-        f"engine.route:{symbol}",
-        engine.route(
-            market=market,
-            term=term,
-            symbol=symbol,
-            decision=decision,
-            mode=execution_mode,
-            quant_score=(quant or {}).get("quant_score"),
-            sentiment_score=(sentiment or {}).get("sentiment_score"),
-            fear_greed_index=(sentiment or {}).get("fear_greed_index"),
-            macro_regime=(sentiment or {}).get("macro_regime"),
+    # Finalize trace.execution with what actually happened
+    trace["execution"] = {
+        "mode_requested": execution_mode.value,
+        "mode_applied": (
+            result.get("effective_mode").value
+            if result and result.get("effective_mode")
+            else None
         ),
+        "executed": bool(result and result.get("executed")),
+        "signal_id": (result or {}).get("signal_id"),
+        "trade_id": (result or {}).get("trade_id"),
+        "route_reason": (result or {}).get("reason"),
+        "had_pending_order": bool(pending_order),
+        "decision_source": decision_source,
+    }
+
+    # Persist the audit row — every exit path lands here.
+    await _persist_audit(
+        market=market, symbol=symbol, use_ai=use_ai,
+        execution_mode=execution_mode, trace=trace,
+        decision=decision, result=result,
     )
 
     log.info(

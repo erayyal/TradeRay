@@ -28,6 +28,10 @@ from sqlalchemy import select
 from config import settings
 from models import (
     AsyncSessionLocal,
+    AuditCategory,
+    AuditMode,
+    AuditOutcome,
+    DecisionAudit,
     ExecutionMode,
     LLMCostLog,
     MarketConfig,
@@ -151,6 +155,35 @@ _STRINGS: dict[str, dict[str, str]] = {
                             "en": "### 💰 LLM API Costs (today, UTC)"},
     "no_costs":            {"tr": "Bugün hiç LLM çağrısı kaydedilmedi.",
                             "en": "No LLM calls logged yet today."},
+    # --- Audit / Decision Trace ---
+    "tab_audit":           {"tr": "🔍 Karar İzleyici",   "en": "🔍 Decision Trace"},
+    "tab_audit_title":     {"tr": "### 🔍 Karar İzleyici — Sistemin neden sinyal attığı / atmadığı",
+                            "en": "### 🔍 Decision Trace — why the system signaled (or didn't)"},
+    "audit_caption":       {"tr": "Her sembol döngüsü için bir satır. `logic_trace` JSON'u indikatörler, kural motoru kararı, AI analizi (varsa) ve doğrulama adımlarının HEPSİNİ kapsar.",
+                            "en": "One row per symbol cycle. The `logic_trace` JSON captures indicators, rule-engine verdict, AI analysis (if any), and validation steps in FULL."},
+    "filter_outcome":      {"tr": "Sonuç",           "en": "Outcome"},
+    "filter_mode":         {"tr": "Mod",             "en": "Mode"},
+    "no_audits":           {"tr": "Bu filtreye uygun kayıt yok.",
+                            "en": "No audit rows match this filter."},
+    "audit_select":        {"tr": "Detay için bir satır seç",
+                            "en": "Select a row to inspect"},
+    "audit_view":          {"tr": "🔎 Detayı Aç / Logları Kopyala",
+                            "en": "🔎 Open detail / Copy logs"},
+    "audit_modal_title":   {"tr": "Karar Detayı — Tam Düşünce Zinciri",
+                            "en": "Decision Detail — Full Reasoning Chain"},
+    "modal_time":          {"tr": "Zaman",  "en": "Time"},
+    "modal_category":      {"tr": "Kategori", "en": "Category"},
+    "modal_mode":          {"tr": "Mod", "en": "Mode"},
+    "modal_outcome":       {"tr": "Sonuç", "en": "Outcome"},
+    "modal_reason":        {"tr": "Özet",  "en": "Reason"},
+    "modal_indicators":    {"tr": "📊 İndikatörler", "en": "📊 Indicators"},
+    "modal_rule_engine":   {"tr": "⚙️ Kural Motoru", "en": "⚙️ Rule Engine"},
+    "modal_ai_analysis":   {"tr": "🤖 AI Analizi (ham)", "en": "🤖 AI Analysis (raw)"},
+    "modal_no_ai":         {"tr": "_Bu döngüde AI çalışmadı (Rule-Only mod veya WAIT)._",
+                            "en": "_AI did not run for this cycle (Rule-Only mode or WAIT)._"},
+    "modal_validation":    {"tr": "🛡 Doğrulama (TP/SL/Risk)", "en": "🛡 Validation (TP/SL/Risk)"},
+    "modal_execution":     {"tr": "🚀 Yürütme", "en": "🚀 Execution"},
+    "modal_full_json":     {"tr": "📋 Tam JSON (kopyalanabilir)", "en": "📋 Full JSON (copyable)"},
     # --- Decision card labels ---
     "justification":       {"tr": "Gerekçe",  "en": "Justification"},
     "chart_obs":           {"tr": "Grafik gözlemleri", "en": "Chart observations"},
@@ -292,6 +325,36 @@ async def _aload_trades(*, days_back: int = 90) -> list[dict[str, Any]]:
     ]
 
 
+async def _aload_audit_logs(
+    *, days_back: int = 7, limit: int = 500
+) -> list[dict[str, Any]]:
+    """Most recent audit rows (newest first), capped at `limit`."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days_back)
+    async with AsyncSessionLocal() as session:
+        rows = (
+            await session.execute(
+                select(DecisionAudit)
+                .where(DecisionAudit.created_at >= cutoff)
+                .order_by(DecisionAudit.created_at.desc())
+                .limit(limit)
+            )
+        ).scalars().all()
+    return [
+        {
+            "id": r.id,
+            "created_at": r.created_at,
+            "category": r.category.value,
+            "market": r.market.value,
+            "symbol": r.symbol,
+            "mode": r.mode.value,
+            "outcome": r.outcome.value,
+            "reason": r.reason,
+            "logic_trace": r.logic_trace or {},
+        }
+        for r in rows
+    ]
+
+
 async def _aload_cost_logs(*, days_back: int = 7) -> list[dict[str, Any]]:
     cutoff = datetime.now(timezone.utc) - timedelta(days=days_back)
     async with AsyncSessionLocal() as session:
@@ -406,6 +469,11 @@ def load_redis_state() -> dict[str, Any]:
 @st.cache_data(ttl=10)
 def load_cost_logs(days_back: int = 7) -> list[dict[str, Any]]:
     return _run_async(_aload_cost_logs(days_back=days_back))
+
+
+@st.cache_data(ttl=10)
+def load_audit_logs(days_back: int = 7, limit: int = 500) -> list[dict[str, Any]]:
+    return _run_async(_aload_audit_logs(days_back=days_back, limit=limit))
 
 
 @st.cache_data(ttl=5)
@@ -951,6 +1019,185 @@ def render_decisions_tab(
                     st.json(bundle.get("sentiment") or {"info": "rule-only cycle (no AI)"})
 
 
+@st.dialog("🔍 Decision Trace Detail", width="large")
+def show_audit_detail(row: dict) -> None:
+    """Modal showing the full reasoning chain for one audit row.
+
+    Each section is rendered as a structured panel; the very bottom carries
+    the entire `logic_trace` JSON in a copy-friendly code block so the user
+    can ship it to a tracker / paste into another tool.
+    """
+    st.markdown(f"### {t('audit_modal_title')}")
+
+    # Header strip
+    cols = st.columns(3)
+    cols[0].markdown(
+        f"**{t('modal_time')}:** {row['created_at']:%Y-%m-%d %H:%M:%S} UTC"
+    )
+    cols[1].markdown(
+        f"**{t('modal_category')}:** `{row['category']}` · "
+        f"**{t('market')}:** `{row['market']}` · "
+        f"**{t('symbols')[:6] if False else 'Symbol'}:** `{row['symbol']}`"
+    )
+    cols[2].markdown(
+        f"**{t('modal_mode')}:** `{row['mode']}` · "
+        f"**{t('modal_outcome')}:** `{row['outcome']}`"
+    )
+    st.markdown(f"**{t('modal_reason')}:** _{row['reason']}_")
+    st.divider()
+
+    trace = row["logic_trace"] or {}
+
+    # ── 📊 Indicators ────────────────────────────────────────────────
+    st.markdown(f"#### {t('modal_indicators')}")
+    inds = trace.get("indicators") or {}
+    if inds:
+        st.json(inds, expanded=False)
+    else:
+        st.caption("—")
+
+    # ── ⚙️ Rule Engine ───────────────────────────────────────────────
+    st.markdown(f"#### {t('modal_rule_engine')}")
+    rule = trace.get("rule_engine") or {}
+    if rule:
+        st.json(rule, expanded=True)
+    else:
+        st.caption("—")
+
+    # ── 🤖 AI Analysis ───────────────────────────────────────────────
+    st.markdown(f"#### {t('modal_ai_analysis')}")
+    ai = trace.get("ai_analysis")
+    if not ai:
+        st.markdown(t("modal_no_ai"))
+    else:
+        # Quant + Sentiment as expandable sub-blocks
+        with st.expander("Quant report", expanded=False):
+            st.json(ai.get("quant_report") or {}, expanded=False)
+        with st.expander("Sentiment report", expanded=False):
+            st.json(ai.get("sentiment_report") or {}, expanded=False)
+        with st.expander("Microstructure (funding / OI / USDTRY)", expanded=False):
+            st.json(ai.get("microstructure") or {}, expanded=False)
+        # Master Trader is the AI's "nihai karar cümlesi" — show in full
+        st.markdown("**Master Trader (final AI verdict, raw):**")
+        st.json(ai.get("master_decision") or {}, expanded=True)
+        st.caption(
+            f"Chart attached to Master: "
+            f"`{ai.get('vision_chart_attached')}` "
+            f"(threshold confidence ≥ {ai.get('vision_threshold', '?')})"
+        )
+
+    # ── 🛡 Validation ────────────────────────────────────────────────
+    st.markdown(f"#### {t('modal_validation')}")
+    st.json(trace.get("validation") or {}, expanded=True)
+
+    # ── 🚀 Execution ─────────────────────────────────────────────────
+    st.markdown(f"#### {t('modal_execution')}")
+    st.json(trace.get("execution") or {}, expanded=True)
+
+    # ── 📋 Full JSON (copy-friendly) ─────────────────────────────────
+    st.divider()
+    st.markdown(f"#### {t('modal_full_json')}")
+    # st.code with `language="json"` adds Streamlit's native copy icon.
+    full_blob = {
+        "id": row["id"],
+        "created_at": row["created_at"].isoformat(),
+        "category": row["category"],
+        "market": row["market"],
+        "symbol": row["symbol"],
+        "mode": row["mode"],
+        "outcome": row["outcome"],
+        "reason": row["reason"],
+        "logic_trace": trace,
+    }
+    st.code(json.dumps(full_blob, indent=2, default=str), language="json")
+
+
+def render_audit_tab(audit_logs: list[dict]) -> None:
+    """Decision Trace tab — table + per-row detail modal."""
+    st.markdown(t("tab_audit_title"))
+    st.caption(t("audit_caption"))
+
+    # Filter row
+    fcols = st.columns([1, 1, 1, 1])
+    with fcols[0]:
+        market_filter = st.selectbox(
+            t("filter_market"),
+            options=["ALL"] + [m.value for m in MarketType], index=0,
+            key="audit_market_filter",
+        )
+    with fcols[1]:
+        outcome_filter = st.selectbox(
+            t("filter_outcome"),
+            options=["ALL"] + [o.value for o in AuditOutcome], index=0,
+            key="audit_outcome_filter",
+        )
+    with fcols[2]:
+        mode_filter = st.selectbox(
+            t("filter_mode"),
+            options=["ALL"] + [m.value for m in AuditMode], index=0,
+            key="audit_mode_filter",
+        )
+    with fcols[3]:
+        category_filter = st.selectbox(
+            t("filter_market") + " (cat)",
+            options=["ALL"] + [c.value for c in AuditCategory], index=0,
+            key="audit_category_filter",
+            label_visibility="visible",
+        )
+
+    rows = audit_logs
+    if market_filter != "ALL":
+        rows = [r for r in rows if r["market"] == market_filter]
+    if outcome_filter != "ALL":
+        rows = [r for r in rows if r["outcome"] == outcome_filter]
+    if mode_filter != "ALL":
+        rows = [r for r in rows if r["mode"] == mode_filter]
+    if category_filter != "ALL":
+        rows = [r for r in rows if r["category"] == category_filter]
+
+    if not rows:
+        st.info(t("no_audits"))
+        return
+
+    # Compact table
+    df_rows = [
+        {
+            "id": r["id"],
+            "Time (UTC)": r["created_at"].strftime("%Y-%m-%d %H:%M:%S"),
+            "Category": r["category"],
+            "Market": r["market"],
+            "Symbol": r["symbol"],
+            "Mode": r["mode"],
+            "Outcome": r["outcome"],
+            "Reason": (r["reason"] or "")[:80],
+        }
+        for r in rows
+    ]
+    st.dataframe(
+        pd.DataFrame(df_rows),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    # Detail picker — select ID from the filtered set, view modal
+    st.markdown("---")
+    by_id = {r["id"]: r for r in rows}
+    id_options = list(by_id.keys())
+    label_of = lambda rid: (
+        f"#{rid} · {by_id[rid]['created_at']:%H:%M:%S} · "
+        f"{by_id[rid]['market']}/{by_id[rid]['symbol']} · "
+        f"{by_id[rid]['outcome']}"
+    )
+    selected_id = st.selectbox(
+        t("audit_select"),
+        options=id_options,
+        format_func=label_of,
+        key="audit_detail_picker",
+    )
+    if st.button(t("audit_view"), key="audit_detail_open", type="primary"):
+        show_audit_detail(by_id[selected_id])
+
+
 def render_costs_tab(cost_logs: list[dict]) -> None:
     st.markdown(t("tab_costs_title"))
     now = datetime.now(timezone.utc)
@@ -999,6 +1246,7 @@ def main() -> None:
     signals = load_signals(days_back=30)
     trades = load_trades(days_back=90)
     cost_logs = load_cost_logs(days_back=7)
+    audit_logs = load_audit_logs(days_back=7, limit=500)
 
     st.title(t("app_title"))
     st.caption(
@@ -1039,8 +1287,11 @@ def main() -> None:
     render_pnl_matrix(trades, signals, redis_state["prices"])
 
     st.divider()
-    t1, t2, t3, t4 = st.tabs([t("tab_signals"), t("tab_trades"),
-                              t("tab_decisions"), t("tab_costs")])
+    t1, t2, t3, t4, t5 = st.tabs([
+        t("tab_signals"), t("tab_trades"),
+        t("tab_decisions"), t("tab_costs"),
+        t("tab_audit"),
+    ])
     with t1:
         render_signals_tab(signals)
     with t2:
@@ -1049,6 +1300,8 @@ def main() -> None:
         render_decisions_tab(redis_state["decisions"], redis_state["prices"])
     with t4:
         render_costs_tab(cost_logs)
+    with t5:
+        render_audit_tab(audit_logs)
 
 
 main()
