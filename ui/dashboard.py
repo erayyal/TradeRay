@@ -184,6 +184,24 @@ _STRINGS: dict[str, dict[str, str]] = {
     "modal_validation":    {"tr": "🛡 Doğrulama (TP/SL/Risk)", "en": "🛡 Validation (TP/SL/Risk)"},
     "modal_execution":     {"tr": "🚀 Yürütme", "en": "🚀 Execution"},
     "modal_full_json":     {"tr": "📋 Tam JSON (kopyalanabilir)", "en": "📋 Full JSON (copyable)"},
+    # Narrative section
+    "narrative_title":     {"tr": "📖 Karar Hikayesi", "en": "📖 Decision Story"},
+    "section_news":        {"tr": "📰 Sistem hangi haberleri okudu",
+                            "en": "📰 What news the system read"},
+    "section_macro":       {"tr": "🌍 Makro tablo",  "en": "🌍 Macro picture"},
+    "section_microstructure": {"tr": "🪙 Mikro yapı (funding / OI / USDTRY)",
+                                "en": "🪙 Microstructure (funding / OI / USDTRY)"},
+    "section_ai_verdict":  {"tr": "🤖 AI'nın nihai kararı",
+                            "en": "🤖 AI's final verdict"},
+    "section_outcome":     {"tr": "🚀 Sonuç",  "en": "🚀 Outcome"},
+    "show_raw_json":       {"tr": "🔧 Geliştirici görünümü (ham JSON)",
+                            "en": "🔧 Developer view (raw JSON)"},
+    "no_news":             {"tr": "_(Bu döngüde haber okunmadı — AI kapalıydı.)_",
+                            "en": "_(No news read this cycle — AI was off.)_"},
+    "no_macro":            {"tr": "_(Makro veriye dokunulmadı.)_",
+                            "en": "_(Macro context not pulled.)_"},
+    "no_micro":            {"tr": "_(Mikro yapı verisi yok.)_",
+                            "en": "_(No microstructure data.)_"},
     # --- Decision card labels ---
     "justification":       {"tr": "Gerekçe",  "en": "Justification"},
     "chart_obs":           {"tr": "Grafik gözlemleri", "en": "Chart observations"},
@@ -1019,97 +1037,362 @@ def render_decisions_tab(
                     st.json(bundle.get("sentiment") or {"info": "rule-only cycle (no AI)"})
 
 
+def _humanize_indicators(inds: dict) -> list[str]:
+    """RSI/MACD/EMA/ATR numerical values → bilingual readable bullets."""
+    if not inds:
+        return []
+    rsi = inds.get("rsi")
+    macd_h = inds.get("macd_hist")
+    above_ema = inds.get("above_ema_slow")
+    atr_pct = inds.get("atr_pct")
+    last = inds.get("last_close")
+    primary = inds.get("primary_interval", "?")
+
+    out: list[str] = []
+    if rsi is not None:
+        if _lang() == "tr":
+            zone = (
+                "aşırı satım" if rsi < 30 else
+                "satım bölgesi" if rsi < 40 else
+                "nötr" if rsi < 60 else
+                "alım bölgesi" if rsi < 70 else
+                "aşırı alım"
+            )
+            out.append(f"**RSI**: `{rsi:.1f}` ({zone})")
+        else:
+            zone = (
+                "extreme oversold" if rsi < 30 else
+                "oversold zone" if rsi < 40 else
+                "neutral" if rsi < 60 else
+                "overbought zone" if rsi < 70 else
+                "extreme overbought"
+            )
+            out.append(f"**RSI**: `{rsi:.1f}` ({zone})")
+    if macd_h is not None:
+        if _lang() == "tr":
+            direction = "pozitif" if macd_h > 0 else "negatif" if macd_h < 0 else "nötr"
+            out.append(f"**MACD histogram**: `{macd_h:+.4f}` ({direction})")
+        else:
+            direction = "positive" if macd_h > 0 else "negative" if macd_h < 0 else "flat"
+            out.append(f"**MACD histogram**: `{macd_h:+.4f}` ({direction})")
+    if above_ema is not None and last is not None:
+        if _lang() == "tr":
+            stance = "EMA yavaşın ÜZERİNDE (yükseliş filtresi)" if above_ema else "EMA yavaşın ALTINDA (düşüş filtresi)"
+            out.append(f"**Fiyat / EMA**: `{last:,.4f}` — {stance}")
+        else:
+            stance = "ABOVE slow EMA (uptrend filter)" if above_ema else "BELOW slow EMA (downtrend filter)"
+            out.append(f"**Price / EMA**: `{last:,.4f}` — {stance}")
+    if atr_pct is not None:
+        if _lang() == "tr":
+            regime = (
+                "düşük" if atr_pct < 0.005 else
+                "normal" if atr_pct < 0.015 else
+                "yüksek" if atr_pct < 0.030 else
+                "ekstrem"
+            )
+            out.append(f"**Volatilite (ATR/fiyat)**: `{atr_pct:.2%}` ({regime})")
+        else:
+            regime = (
+                "low" if atr_pct < 0.005 else
+                "normal" if atr_pct < 0.015 else
+                "elevated" if atr_pct < 0.030 else
+                "extreme"
+            )
+            out.append(f"**Volatility (ATR/price)**: `{atr_pct:.2%}` ({regime})")
+    out.append(
+        f"_({_lang() and 'birincil grafik' if _lang()=='tr' else 'primary chart'}: `{primary}`)_"
+    )
+    return out
+
+
+def _outcome_emoji(outcome: str) -> str:
+    return {
+        "EXECUTED": "✅",
+        "SIGNAL_SENT": "📡",
+        "WAITED": "⏸",
+        "REJECTED": "❌",
+        "ERROR": "💥",
+    }.get(outcome, "•")
+
+
+def _decision_headline(row: dict) -> str:
+    """Bilingual one-liner: 'BTCUSDT için CRYPTO Bot WAITED — neden'."""
+    emo = _outcome_emoji(row["outcome"])
+    if _lang() == "tr":
+        outcome_word = {
+            "EXECUTED": "EMİR GÖNDERİLDİ",
+            "SIGNAL_SENT": "SİNYAL ÜRETİLDİ",
+            "WAITED": "BEKLEDİ",
+            "REJECTED": "REDDEDİLDİ",
+            "ERROR": "HATA",
+        }.get(row["outcome"], row["outcome"])
+        mode_word = "AI ile" if row["mode"] == "AI_ENABLED" else "Sadece Kural Motoru"
+        return f"{emo} **{row['symbol']}** · {row['market']} · {mode_word} → **{outcome_word}**"
+    outcome_word = {
+        "EXECUTED": "ORDER PLACED",
+        "SIGNAL_SENT": "SIGNAL LOGGED",
+        "WAITED": "WAITED",
+        "REJECTED": "REJECTED",
+        "ERROR": "ERROR",
+    }.get(row["outcome"], row["outcome"])
+    mode_word = "AI verified" if row["mode"] == "AI_ENABLED" else "Rule engine only"
+    return f"{emo} **{row['symbol']}** · {row['market']} · {mode_word} → **{outcome_word}**"
+
+
+def _humanize_macro(macro: dict) -> list[str]:
+    """FRED-style macro snapshot → bilingual readable bullets."""
+    if not macro or not macro.get("available", True):
+        return []
+    out: list[str] = []
+    vix = macro.get("vix")
+    t10y2y = macro.get("yield_curve_10y2y")
+    dxy = macro.get("dxy")
+    dff = macro.get("fed_funds_rate")
+    dgs10 = macro.get("us_10y_treasury")
+
+    if vix is not None:
+        if _lang() == "tr":
+            tone = "düşük (sakin)" if vix < 15 else "normal" if vix < 20 else "yüksek (gergin)" if vix < 30 else "kriz seviyesi"
+            out.append(f"**VIX**: `{vix:.1f}` ({tone})")
+        else:
+            tone = "low (calm)" if vix < 15 else "normal" if vix < 20 else "elevated (anxious)" if vix < 30 else "crisis"
+            out.append(f"**VIX**: `{vix:.1f}` ({tone})")
+    if t10y2y is not None:
+        if _lang() == "tr":
+            tone = "TERS (resesyon sinyali)" if t10y2y < 0 else "düz" if t10y2y < 0.3 else "dik (sağlıklı)"
+            out.append(f"**10Y-2Y verim eğrisi**: `{t10y2y:+.2f}` ({tone})")
+        else:
+            tone = "INVERTED (recession signal)" if t10y2y < 0 else "flat" if t10y2y < 0.3 else "steep (healthy)"
+            out.append(f"**10Y-2Y yield curve**: `{t10y2y:+.2f}` ({tone})")
+    if dxy is not None:
+        out.append(f"**DXY (USD endeksi)**: `{dxy:.2f}`" if _lang() == "tr"
+                   else f"**DXY (USD index)**: `{dxy:.2f}`")
+    if dff is not None:
+        out.append(f"**Fed Funds**: `{dff:.2f}%`")
+    if dgs10 is not None:
+        out.append(f"**US 10Y**: `{dgs10:.2f}%`")
+    return out
+
+
 @st.dialog("🔍 Decision Trace Detail", width="large")
 def show_audit_detail(row: dict) -> None:
-    """Modal showing the full reasoning chain for one audit row.
-
-    Each section is rendered as a structured panel; the very bottom carries
-    the entire `logic_trace` JSON in a copy-friendly code block so the user
-    can ship it to a tracker / paste into another tool.
+    """Narrative-first modal:
+       1) Headline + reason
+       2) Indicator readout in plain language
+       3) News read this cycle (AI mode)
+       4) Macro picture
+       5) Microstructure
+       6) AI verdict (Master Trader's justification sentence)
+       7) Outcome
+       8) Full raw JSON at the bottom (for devs / copy-paste).
     """
-    st.markdown(f"### {t('audit_modal_title')}")
-
-    # Header strip
-    cols = st.columns(3)
-    cols[0].markdown(
-        f"**{t('modal_time')}:** {row['created_at']:%Y-%m-%d %H:%M:%S} UTC"
-    )
-    cols[1].markdown(
-        f"**{t('modal_category')}:** `{row['category']}` · "
-        f"**{t('market')}:** `{row['market']}` · "
-        f"**{t('symbols')[:6] if False else 'Symbol'}:** `{row['symbol']}`"
-    )
-    cols[2].markdown(
-        f"**{t('modal_mode')}:** `{row['mode']}` · "
-        f"**{t('modal_outcome')}:** `{row['outcome']}`"
-    )
-    st.markdown(f"**{t('modal_reason')}:** _{row['reason']}_")
-    st.divider()
-
     trace = row["logic_trace"] or {}
 
-    # ── 📊 Indicators ────────────────────────────────────────────────
-    st.markdown(f"#### {t('modal_indicators')}")
-    inds = trace.get("indicators") or {}
-    if inds:
-        st.json(inds, expanded=False)
-    else:
-        st.caption("—")
+    # ── Header ───────────────────────────────────────────────────────
+    st.markdown(f"## {t('narrative_title')}")
+    st.markdown(_decision_headline(row))
+    st.caption(
+        f"{row['created_at']:%Y-%m-%d %H:%M:%S} UTC · "
+        f"{t('modal_category')}: `{row['category']}` · "
+        f"{t('modal_mode')}: `{row['mode']}` · "
+        f"{t('term').lower()}: `{trace.get('indicators', {}).get('primary_interval', '?')}`"
+    )
+    st.info(f"**{t('modal_reason')}:** {row['reason'] or '—'}")
 
-    # ── ⚙️ Rule Engine ───────────────────────────────────────────────
-    st.markdown(f"#### {t('modal_rule_engine')}")
+    # ── Rule engine verdict (one sentence) ───────────────────────────
     rule = trace.get("rule_engine") or {}
     if rule:
-        st.json(rule, expanded=True)
+        st.markdown(f"### {t('modal_rule_engine')}")
+        decision = rule.get("decision", "?")
+        confidence = rule.get("confidence", 0)
+        emoji = {"LONG": "🟢", "SHORT": "🔴", "WAIT": "🟡"}.get(decision, "⚪")
+        if _lang() == "tr":
+            st.markdown(
+                f"{emoji} **Karar:** `{decision}` · **Güven:** `{confidence}/100`"
+            )
+        else:
+            st.markdown(
+                f"{emoji} **Decision:** `{decision}` · **Confidence:** `{confidence}/100`"
+            )
+        if rule.get("justification"):
+            st.write(rule["justification"])
+        if decision in ("LONG", "SHORT"):
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric(t("entry"), f"{rule.get('entry'):,.4f}" if rule.get("entry") else "—")
+            c2.metric(t("tp"),    f"{rule.get('tp'):,.4f}" if rule.get("tp") else "—")
+            c3.metric(t("sl"),    f"{rule.get('sl'):,.4f}" if rule.get("sl") else "—")
+            c4.metric(t("rr"),    f"{rule.get('rr'):.2f}" if rule.get("rr") else "—")
+
+    # ── Indicators in plain language ─────────────────────────────────
+    st.markdown(f"### {t('modal_indicators')}")
+    inds = trace.get("indicators") or {}
+    bullets = _humanize_indicators(inds)
+    if bullets:
+        for b in bullets:
+            st.markdown(f"- {b}")
     else:
         st.caption("—")
 
-    # ── 🤖 AI Analysis ───────────────────────────────────────────────
-    st.markdown(f"#### {t('modal_ai_analysis')}")
+    # ── News (AI mode) ───────────────────────────────────────────────
     ai = trace.get("ai_analysis")
+    st.markdown(f"### {t('section_news')}")
+    if not ai:
+        st.markdown(t("no_news"))
+    else:
+        sent = ai.get("sentiment_report") or {}
+        catalysts = sent.get("news_catalysts") or []
+        if catalysts:
+            for c in catalysts:
+                impact = c.get("impact_tier", "?")
+                direction = c.get("direction", "?")
+                regime = "🔥" if c.get("is_regime_shifting") else "•"
+                arrow = {"bullish": "🟢", "bearish": "🔴"}.get(direction, "⚪")
+                st.markdown(
+                    f"- {regime} {arrow} `[{impact}]` "
+                    f"**{c.get('headline', '—')}**"
+                )
+        else:
+            st.markdown(t("no_news"))
+
+    # ── Macro picture ────────────────────────────────────────────────
+    st.markdown(f"### {t('section_macro')}")
+    macro_data: dict = {}
+    if ai:
+        sent = ai.get("sentiment_report") or {}
+        # Sentiment'in macro_regime / fear_greed_label oradan gelir
+        fg = sent.get("fear_greed_label")
+        regime = sent.get("macro_regime")
+        if fg or regime:
+            if _lang() == "tr":
+                tr_regime = {
+                    "risk_on": "RİSK-ON (büyüme dostu)",
+                    "risk_off": "RİSK-OFF (savunmacı)",
+                    "neutral": "nötr",
+                }.get(regime, regime)
+                tr_fg = {
+                    "extreme_fear": "aşırı korku",
+                    "fear": "korku",
+                    "neutral": "nötr",
+                    "greed": "açgözlülük",
+                    "extreme_greed": "aşırı açgözlülük",
+                }.get(fg, fg)
+                st.markdown(
+                    f"**Genel rejim**: `{tr_regime}` · **Korku/Açgözlülük**: `{tr_fg}`"
+                )
+            else:
+                st.markdown(
+                    f"**Regime**: `{regime}` · **Fear/Greed**: `{fg}`"
+                )
+        # Macro drivers from the sentiment_report
+        drivers = sent.get("macro_drivers") or []
+        if drivers:
+            for d in drivers:
+                arrow = "🟢" if d.get("direction") == "risk_on" else "🔴"
+                st.markdown(
+                    f"- {arrow} **{d.get('factor', '?')}**: "
+                    f"`{d.get('value')}` ({d.get('direction')})"
+                )
+    if not ai:
+        st.markdown(t("no_macro"))
+
+    # ── Microstructure ───────────────────────────────────────────────
+    st.markdown(f"### {t('section_microstructure')}")
+    if ai and ai.get("microstructure"):
+        micro = ai["microstructure"]
+        funding = micro.get("funding_rate")
+        oi = micro.get("open_interest")
+        usdtry = micro.get("usdtry")
+        if funding:
+            st.markdown(
+                f"- **Funding rate**: `{funding.get('funding_rate', 0):+.4%}` "
+                f"(yıllık ≈ `{funding.get('annualized_pct', 0):+.1f}%`)"
+            )
+        if oi:
+            st.markdown(
+                f"- **Açık pozisyon (OI)**: `{oi.get('open_interest_base', 0):,.2f}` "
+                f"(USD karşılığı `${oi.get('open_interest_usd', 0):,.0f}`)"
+            )
+        if usdtry:
+            pct = usdtry.get("pct_change_1d", 0) * 100
+            st.markdown(
+                f"- **USDTRY**: `{usdtry.get('rate', 0):.4f}` "
+                f"(günlük değişim `{pct:+.2f}%`)"
+            )
+        if not (funding or oi or usdtry):
+            st.markdown(t("no_micro"))
+    else:
+        st.markdown(t("no_micro"))
+
+    # ── AI verdict ───────────────────────────────────────────────────
+    st.markdown(f"### {t('section_ai_verdict')}")
     if not ai:
         st.markdown(t("modal_no_ai"))
     else:
-        # Quant + Sentiment as expandable sub-blocks
-        with st.expander("Quant report", expanded=False):
-            st.json(ai.get("quant_report") or {}, expanded=False)
-        with st.expander("Sentiment report", expanded=False):
-            st.json(ai.get("sentiment_report") or {}, expanded=False)
-        with st.expander("Microstructure (funding / OI / USDTRY)", expanded=False):
-            st.json(ai.get("microstructure") or {}, expanded=False)
-        # Master Trader is the AI's "nihai karar cümlesi" — show in full
-        st.markdown("**Master Trader (final AI verdict, raw):**")
-        st.json(ai.get("master_decision") or {}, expanded=True)
-        st.caption(
-            f"Chart attached to Master: "
-            f"`{ai.get('vision_chart_attached')}` "
-            f"(threshold confidence ≥ {ai.get('vision_threshold', '?')})"
+        master = ai.get("master_decision") or {}
+        if master:
+            d = master.get("decision", "?")
+            conf = master.get("confidence_level", 0)
+            emoji = {"LONG": "🟢", "SHORT": "🔴", "WAIT": "🟡", "CANCEL_PENDING": "🟣"}.get(d, "⚪")
+            st.markdown(f"{emoji} **{d}** · {conf}/100")
+            if master.get("justification"):
+                # Bu "AI'nın nihai karar cümlesi" — özellikle kırpılmaz
+                st.write(master["justification"])
+            if master.get("chart_observations"):
+                st.caption(
+                    "🖼 " + " · ".join(master["chart_observations"][:5])
+                )
+            if master.get("conflict_flags"):
+                st.warning("⚠️ " + ", ".join(master["conflict_flags"]))
+        else:
+            st.caption("Master Trader yanıtı yok / no Master Trader response")
+
+    # ── Final outcome ────────────────────────────────────────────────
+    st.markdown(f"### {t('section_outcome')}")
+    exec_info = trace.get("execution") or {}
+    val = trace.get("validation") or {}
+    if val.get("decision") in ("LONG", "SHORT") and val.get("has_complete_plan"):
+        if _lang() == "tr":
+            st.markdown(
+                f"Plan: **{val['decision']}** giriş `{val.get('entry'):,.4f}`, "
+                f"TP `{val.get('take_profit'):,.4f}`, SL `{val.get('stop_loss'):,.4f}`, "
+                f"R:R `{val.get('reward_risk_ratio'):.2f}`, Risk `${val.get('risk_usd', 0):,.2f}`"
+            )
+        else:
+            st.markdown(
+                f"Plan: **{val['decision']}** entry `{val.get('entry'):,.4f}`, "
+                f"TP `{val.get('take_profit'):,.4f}`, SL `{val.get('stop_loss'):,.4f}`, "
+                f"R:R `{val.get('reward_risk_ratio'):.2f}`, risk `${val.get('risk_usd', 0):,.2f}`"
+            )
+    if _lang() == "tr":
+        st.markdown(
+            f"Yürütme modu: `{exec_info.get('mode_applied')}` (istenen "
+            f"`{exec_info.get('mode_requested')}`) — "
+            f"emir gönderildi mi: **{'Evet' if exec_info.get('executed') else 'Hayır'}**"
         )
+    else:
+        st.markdown(
+            f"Execution mode: `{exec_info.get('mode_applied')}` (requested "
+            f"`{exec_info.get('mode_requested')}`) — "
+            f"order placed: **{'Yes' if exec_info.get('executed') else 'No'}**"
+        )
+    if exec_info.get("route_reason"):
+        st.caption(f"_engine.route reason: `{exec_info['route_reason']}`_")
 
-    # ── 🛡 Validation ────────────────────────────────────────────────
-    st.markdown(f"#### {t('modal_validation')}")
-    st.json(trace.get("validation") or {}, expanded=True)
-
-    # ── 🚀 Execution ─────────────────────────────────────────────────
-    st.markdown(f"#### {t('modal_execution')}")
-    st.json(trace.get("execution") or {}, expanded=True)
-
-    # ── 📋 Full JSON (copy-friendly) ─────────────────────────────────
+    # ── Raw JSON at the very bottom ──────────────────────────────────
     st.divider()
-    st.markdown(f"#### {t('modal_full_json')}")
-    # st.code with `language="json"` adds Streamlit's native copy icon.
-    full_blob = {
-        "id": row["id"],
-        "created_at": row["created_at"].isoformat(),
-        "category": row["category"],
-        "market": row["market"],
-        "symbol": row["symbol"],
-        "mode": row["mode"],
-        "outcome": row["outcome"],
-        "reason": row["reason"],
-        "logic_trace": trace,
-    }
-    st.code(json.dumps(full_blob, indent=2, default=str), language="json")
+    with st.expander(t("show_raw_json"), expanded=False):
+        full_blob = {
+            "id": row["id"],
+            "created_at": row["created_at"].isoformat(),
+            "category": row["category"],
+            "market": row["market"],
+            "symbol": row["symbol"],
+            "mode": row["mode"],
+            "outcome": row["outcome"],
+            "reason": row["reason"],
+            "logic_trace": trace,
+        }
+        st.code(json.dumps(full_blob, indent=2, default=str), language="json")
 
 
 def render_audit_tab(audit_logs: list[dict]) -> None:
