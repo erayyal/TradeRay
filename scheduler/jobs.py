@@ -292,14 +292,14 @@ _DIGEST_JOB_ID: str = "telegram:daily_digest"
 async def send_daily_digest() -> None:
     """Compute the previous 24h performance and ship a Telegram summary.
 
-    Window: [start, end) where end = today 00:00 UTC, start = yesterday 00:00.
-    The header therefore reports on "yesterday" — the day that just ended.
+    Window: yesterday's full LOCAL day (Europe/Istanbul). The cron trigger
+    fires at 00:00 Istanbul; we report on the calendar day that just ended
+    in TR time. Postgres timestamp columns are timezone-aware, so the
+    UTC-converted window endpoints filter correctly server-side.
 
-    Realized PnL = closed Crypto AUTO_BOT trades whose `closed_at` falls in the
-    window. Theoretical PnL = signals whose `raw_payload["resolution"]` was
-    written by the tracker with a `resolved_at` in the window. We scan a
-    30-day signal cohort to catch resolutions of older signals that closed
-    yesterday — the resolution time, not the creation time, is what matters.
+    Realized PnL = closed Crypto AUTO_BOT trades whose `closed_at` falls in
+    the window. Theoretical PnL = signals whose `raw_payload["resolution"]`
+    was written with `resolved_at` in the window.
 
     Silently no-ops when Telegram isn't configured.
     """
@@ -307,9 +307,17 @@ async def send_daily_digest() -> None:
         log.debug("scheduler.digest.skipped", reason="telegram_not_configured")
         return
 
-    now = datetime.now(timezone.utc)
-    end = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
-    start = end - timedelta(days=1)
+    # Build the window in Istanbul time, then convert endpoints to UTC for
+    # the DB query. ZoneInfo is stdlib (Python 3.9+) — no extra dep.
+    from zoneinfo import ZoneInfo
+    TR = ZoneInfo("Europe/Istanbul")
+
+    now_tr = datetime.now(TR)
+    end_tr = datetime(now_tr.year, now_tr.month, now_tr.day, tzinfo=TR)
+    start_tr = end_tr - timedelta(days=1)
+    # Convert to UTC for the timezone-aware comparison in Postgres
+    start = start_tr.astimezone(timezone.utc)
+    end = end_tr.astimezone(timezone.utc)
 
     # ---- Realized Crypto PnL ----------------------------------------------
     async with AsyncSessionLocal() as session:
@@ -367,8 +375,10 @@ async def send_daily_digest() -> None:
         else:
             bucket["losses"] += 1
 
+    date_str = start_tr.strftime("%Y-%m-%d")  # TR-local date label
+
     await notify_daily_digest(
-        date_str=start.strftime("%Y-%m-%d"),
+        date_str=date_str,
         crypto_pnl=crypto_pnl,
         crypto_wins=crypto_wins,
         crypto_losses=crypto_losses,
@@ -378,7 +388,8 @@ async def send_daily_digest() -> None:
 
     log.info(
         "scheduler.digest.sent",
-        date=start.strftime("%Y-%m-%d"),
+        date=date_str,
+        tz="Europe/Istanbul",
         crypto_trades=len(trades),
         crypto_pnl=round(crypto_pnl, 2),
         n_markets_with_signals=len(summary),
@@ -394,12 +405,18 @@ async def _daily_digest_job_wrapper() -> None:
 
 
 def _configure_digest_job(scheduler: AsyncIOScheduler) -> None:
-    """Register the midnight digest job (idempotent via replace_existing)."""
+    """Register the midnight digest job (idempotent via replace_existing).
+
+    Fires at LOCAL midnight (Europe/Istanbul, UTC+3) — matches the user's
+    calendar day. The digest's `start` window is still UTC-based internally
+    (the Trade/Signal rows are timezone-aware), but the trigger and the
+    `date_str` header read like a natural Turkish "günsonu" report.
+    """
     scheduler.add_job(
         _daily_digest_job_wrapper,
-        trigger=CronTrigger(hour=0, minute=0, timezone="UTC"),
+        trigger=CronTrigger(hour=0, minute=0, timezone="Europe/Istanbul"),
         id=_DIGEST_JOB_ID,
-        name="Telegram: midnight daily digest (UTC)",
+        name="Telegram: midnight daily digest (Europe/Istanbul)",
         replace_existing=True,
         max_instances=1,
         coalesce=True,
@@ -407,7 +424,7 @@ def _configure_digest_job(scheduler: AsyncIOScheduler) -> None:
         # the whole day) but doesn't spam if the process was offline for hours.
         misfire_grace_time=600,
     )
-    log.info("scheduler.digest_job_scheduled", job_id=_DIGEST_JOB_ID)
+    log.info("scheduler.digest_job_scheduled", job_id=_DIGEST_JOB_ID, tz="Europe/Istanbul")
 
 
 __all__ = [
