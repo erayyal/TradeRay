@@ -289,8 +289,9 @@ def _yf_dataframe_to_candles(df: "pd.DataFrame") -> list[dict]:
 
 
 def _resample_to_4h(df_1h: "pd.DataFrame") -> "pd.DataFrame":
+    # pandas 2.2+ deprecated uppercase frequency aliases — "4H" → "4h".
     agg = {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}
-    return df_1h.resample("4H", label="right", closed="right").agg(agg).dropna()
+    return df_1h.resample("4h", label="right", closed="right").agg(agg).dropna()
 
 
 def _yfinance_fetch_sync(symbol: str, interval: str) -> list[dict]:
