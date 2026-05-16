@@ -129,9 +129,22 @@ class ExecutionEngine:
                     "reason": "rejected_missing_tp_sl",
                 }
 
-        # 2. Persist the signal — UI / backtest / audit depend on it.
-        # WAIT signals ARE persisted (audit trail). Only the strict TP/SL
-        # gate above can drop a row before this line runs.
+        # 2. WAIT short-circuit — do NOT persist WAIT to the signals table.
+        # Every cycle of every symbol produces a WAIT >95% of the time; writing
+        # those to `signals` floods the table (240 rows/day per market) and
+        # the UI's "Latest Signals" panel becomes useless.
+        # The audit trail is already covered by `decision_audit` (every cycle
+        # exit writes one row there, including WAITs with full logic_trace).
+        if action == "WAIT":
+            return {
+                "signal_id": None,
+                "trade_id": None,
+                "executed": False,
+                "effective_mode": effective_mode,
+                "reason": "decision_wait",
+            }
+
+        # 3. Persist the actionable signal — UI / backtest / audit depend on it.
         signal_id = await self._persist_signal(
             market=market,
             term=term,
@@ -142,16 +155,6 @@ class ExecutionEngine:
             fear_greed_index=fear_greed_index,
             macro_regime=macro_regime,
         )
-
-        # 3. Branch: WAIT → done.
-        if action == "WAIT":
-            return {
-                "signal_id": signal_id,
-                "trade_id": None,
-                "executed": False,
-                "effective_mode": effective_mode,
-                "reason": "decision_wait",
-            }
 
         # 4. SIGNAL_ONLY (either by request or by coercion) → done.
         # Fire a Telegram alert so the user sees the signal in real time.

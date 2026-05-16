@@ -54,7 +54,10 @@ st.set_page_config(
     page_icon="📈",
     initial_sidebar_state="expanded",
 )
-st.markdown("<meta http-equiv='refresh' content='30'>", unsafe_allow_html=True)
+# NOTE: removed the 30s meta-refresh — it nuked scroll position, modals, and
+# tab state every half-minute. The page is now manually refreshed via the
+# "🔄 Yenile" sidebar button (calls `st.rerun()`). Streamlit's natural rerun
+# on any widget interaction is plenty for everyday use.
 
 
 # ============================================================================
@@ -66,8 +69,10 @@ _STRINGS: dict[str, dict[str, str]] = {
     "app_title":           {"tr": "📈 TradeRay — Küresel Finans Terminali",
                             "en": "📈 TradeRay — Global Financial Terminal"},
     "as_of":               {"tr": "Güncelleme",   "en": "As of"},
-    "auto_refresh":        {"tr": "30sn'de bir otomatik yenileniyor",
-                            "en": "Auto-refresh every 30s"},
+    "auto_refresh":        {"tr": "manuel yenileme (kenar çubuğundan)",
+                            "en": "manual refresh (sidebar button)"},
+    "refresh_now":         {"tr": "🔄 Yenile",
+                            "en": "🔄 Refresh"},
     # --- Sidebar ---
     "language":            {"tr": "🌐 Dil",       "en": "🌐 Language"},
     "system":              {"tr": "Sistem",       "en": "System"},
@@ -691,6 +696,13 @@ def render_sidebar(
     )
     if lang_choice != _lang():
         st.session_state["lang"] = lang_choice
+        st.rerun()
+
+    # Manual refresh button — replaces the removed 30s meta-refresh.
+    # Streamlit cache is keyed by function args, so this rerun pulls fresh
+    # DB / Redis data without server-side wholesale invalidation.
+    if st.sidebar.button(t("refresh_now"), use_container_width=True):
+        st.cache_data.clear()
         st.rerun()
 
     # Help button → modal
