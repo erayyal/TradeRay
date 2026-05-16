@@ -45,10 +45,19 @@ async def _amain(argv: list[str]) -> int:
     start = _parse_date(args.start)
     end = _parse_date(args.end)
 
-    result = await run_walk_forward(
-        symbol=args.symbol, market=market, term=term,
-        start=start, end=end, n_bars=args.n_bars, n_trials=args.n_trials,
-    )
+    try:
+        result = await run_walk_forward(
+            symbol=args.symbol, market=market, term=term,
+            start=start, end=end, n_bars=args.n_bars, n_trials=args.n_trials,
+        )
+    finally:
+        # Close any aiohttp/Binance clients the fetchers opened so the script
+        # doesn't print "Unclosed client session" warnings on exit.
+        try:
+            from data_fetchers.market_fetcher import fetcher
+            await fetcher._binance.close()
+        except Exception:
+            pass
 
     s = result.summary
     print()
