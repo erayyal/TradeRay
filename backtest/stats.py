@@ -57,12 +57,21 @@ def _kurt(xs: Sequence[float]) -> float:
 
 
 def per_trade_sharpe(returns: Sequence[float]) -> float:
-    """Per-trade Sharpe (no annualization). Use `annualize` separately."""
+    """Per-trade Sharpe (no annualization). Use `annualize` separately.
+
+    Returns 0.0 when the return series has effectively zero dispersion
+    (constant returns or numerical noise). The epsilon guards against
+    `stdev` being a tiny float-precision residual on identical inputs.
+    """
     if len(returns) < 2:
         return 0.0
     mu = _mean(returns)
     sd = _stdev(returns)
-    return mu / sd if sd > 0 else 0.0
+    # Threshold ~1e-12 of typical return scale — any real strategy has SD
+    # orders of magnitude larger than this. Anything below is FP noise.
+    if sd < 1e-12 * max(abs(mu), 1.0):
+        return 0.0
+    return mu / sd
 
 
 def bootstrap_pvalue(
