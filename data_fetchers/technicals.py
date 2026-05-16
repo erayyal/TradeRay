@@ -1,18 +1,19 @@
 """TA-Lib indicator computation with timeframe-aware lookbacks.
 
-`compute_indicators(candles, lookbacks=None)` accepts a `lookbacks` dict so the
-caller (orchestrator / market_fetcher) can scale RSI/MACD/BB/ATR/EMA periods
-to the active interval — e.g. RSI(9) on 5m vs RSI(14) on 4h+.
+Computes the full indicator stack needed by the literature-grounded rule
+engine (see RESEARCH_ALGORITHM.md §3 + §9):
 
-Lookback dict shape (all keys optional; defaults below fill missing values):
-    {
-        "rsi":      14,                 # int
-        "macd":     (12, 26, 9),        # (fast, slow, signal)
-        "bbands":   20,                 # int
-        "atr":      14,                 # int
-        "ema_fast": 50,                 # int
-        "ema_slow": 200,                # int
-    }
+  - RSI (Wilder, 14)              — overbought / oversold (Wilder 1978)
+  - RSI(2)                        — Connors short-term mean-reversion signal
+  - MACD (12,26,9)                — momentum
+  - Bollinger (20, 2σ)            — vol regime + mean-reversion bands
+  - ATR (Wilder, 14)              — vol-aware risk sizing (Wilder 1978)
+  - ADX + ±DI (Wilder, 14)        — trend strength regime (Wilder 1978)
+  - EMA fast / EMA slow           — trend filter (BLL 1992)
+  - Volume SMA (20) + rel_volume  — confirmation gate (Karpoff 1987)
+
+`lookbacks` lets the caller override any period per active interval — the
+orchestrator passes the dict from `market_fetcher.lookbacks_for(iv)`.
 """
 from __future__ import annotations
 
@@ -23,26 +24,27 @@ import talib
 
 
 # ---------------------------------------------------------------------------
-# Defaults — used if caller passes no `lookbacks` (preserves prior behavior)
+# Defaults — used if caller passes no `lookbacks`
 # ---------------------------------------------------------------------------
 
 DEFAULT_LOOKBACKS: dict[str, Any] = {
-    "rsi": 14,
+    "rsi": 14,                # Wilder
+    "rsi_short": 2,           # Connors RSI(2) — always also computed
     "macd": (12, 26, 9),
     "bbands": 20,
-    "atr": 14,
+    "atr": 14,                # Wilder
+    "adx": 14,                # Wilder (DMI)
     "ema_fast": 50,
     "ema_slow": 200,
+    "volume_ma": 20,
 }
 
 
 def _merge_lookbacks(lookbacks: dict[str, Any] | None) -> dict[str, Any]:
-    """Fill any missing keys from DEFAULT_LOOKBACKS without mutating the input."""
     if not lookbacks:
         return dict(DEFAULT_LOOKBACKS)
     merged = dict(DEFAULT_LOOKBACKS)
     merged.update(lookbacks)
-    # Coerce macd to tuple if a list slipped in (JSON round-trip)
     if isinstance(merged["macd"], list):
         merged["macd"] = tuple(merged["macd"])
     return merged
@@ -58,23 +60,22 @@ def _last(arr: np.ndarray) -> float | None:
 def _tail(arr: np.ndarray, n: int = 20) -> List[float | None]:
     if arr.size == 0:
         return []
-    out: List[float | None] = []
-    for v in arr[-n:]:
-        out.append(float(v) if not np.isnan(v) else None)
-    return out
+    return [float(v) if not np.isnan(v) else None for v in arr[-n:]]
 
 
 def _min_required_bars(lb: dict[str, Any]) -> int:
-    """Minimum candles needed for the slowest indicator to produce a value."""
     macd_slow = lb["macd"][1] if isinstance(lb["macd"], (tuple, list)) else 26
+    macd_signal = lb["macd"][2] if isinstance(lb["macd"], (tuple, list)) else 9
     return max(
         int(lb["rsi"]),
-        int(macd_slow) + int(lb["macd"][2] if isinstance(lb["macd"], (tuple, list)) else 9),
+        int(lb["rsi_short"]),
+        int(macd_slow) + int(macd_signal),
         int(lb["bbands"]),
         int(lb["atr"]),
+        int(lb["adx"]) * 2,  # ADX needs ~2× period to stabilize
         int(lb["ema_fast"]),
-        # ema_slow is allowed to be larger than the candle history — we shrink it below
         min(int(lb["ema_slow"]), 50),
+        int(lb["volume_ma"]),
     )
 
 
@@ -82,18 +83,14 @@ def compute_indicators(
     candles: Sequence[dict],
     lookbacks: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Compute RSI / MACD / Bollinger / ATR / EMA snapshots from OHLCV.
+    """Compute the full RSI / MACD / Bollinger / ATR / ADX / EMA / Volume stack.
 
-    Returns a dict of latest values + the recent series tail (last 20 points)
-    so the LLM can reason about momentum, not just levels.
+    Returns the latest value of every indicator plus recent series tails
+    (last 20 points) so the rule engine and LLM can reason about momentum,
+    not just levels.
 
-    Args:
-        candles: list of {open_time, open, high, low, close, volume, close_time}.
-        lookbacks: optional dict overriding any subset of DEFAULT_LOOKBACKS.
-
-    Returns:
-        - On success: a dict matching the schema below.
-        - On insufficient data: {"error": "insufficient_data", "n": <count>}.
+    Returns {"error": "insufficient_data", ...} when the candle history is
+    too short for the slowest indicator to produce a value.
     """
     lb = _merge_lookbacks(lookbacks)
     min_bars = _min_required_bars(lb)
@@ -104,10 +101,13 @@ def compute_indicators(
     high = np.array([c["high"] for c in candles], dtype=np.float64)
     low = np.array([c["low"] for c in candles], dtype=np.float64)
     close = np.array([c["close"] for c in candles], dtype=np.float64)
+    volume = np.array([c.get("volume", 0) or 0 for c in candles], dtype=np.float64)
 
-    # Indicators ------------------------------------------------------------
+    # ─── RSI(14) + RSI(2) ────────────────────────────────────────────────
     rsi = talib.RSI(close, timeperiod=int(lb["rsi"]))
+    rsi_short = talib.RSI(close, timeperiod=int(lb["rsi_short"]))
 
+    # ─── MACD ────────────────────────────────────────────────────────────
     macd_fast, macd_slow, macd_signal = lb["macd"]
     macd, macd_sig, macd_hist = talib.MACD(
         close,
@@ -116,21 +116,33 @@ def compute_indicators(
         signalperiod=int(macd_signal),
     )
 
+    # ─── Bollinger Bands ─────────────────────────────────────────────────
     bb_upper, bb_middle, bb_lower = talib.BBANDS(
         close, timeperiod=int(lb["bbands"]), nbdevup=2, nbdevdn=2
     )
 
+    # ─── ATR ─────────────────────────────────────────────────────────────
     atr = talib.ATR(high, low, close, timeperiod=int(lb["atr"]))
 
+    # ─── ADX + DI± (regime detector) ─────────────────────────────────────
+    adx = talib.ADX(high, low, close, timeperiod=int(lb["adx"]))
+    plus_di = talib.PLUS_DI(high, low, close, timeperiod=int(lb["adx"]))
+    minus_di = talib.MINUS_DI(high, low, close, timeperiod=int(lb["adx"]))
+
+    # ─── EMAs ────────────────────────────────────────────────────────────
     ema_fast = talib.EMA(close, timeperiod=int(lb["ema_fast"]))
-    # ema_slow is best-effort: if user asked for EMA(200) but we only have
-    # 120 bars, shrink to len-1 so we still emit a value rather than NaN.
     ema_slow_period = min(int(lb["ema_slow"]), max(2, len(close) - 1))
     ema_slow = talib.EMA(close, timeperiod=ema_slow_period)
 
+    # ─── Volume MA + relative volume ─────────────────────────────────────
+    vol_ma = talib.SMA(volume, timeperiod=int(lb["volume_ma"]))
+    last_vol = _last(volume)
+    last_vol_ma = _last(vol_ma)
+    rel_volume = (last_vol / last_vol_ma) if (last_vol and last_vol_ma) else None
+
+    # ─── Derived ─────────────────────────────────────────────────────────
     last_close = float(close[-1])
 
-    # Bollinger position: 0 = at lower band, 1 = at upper band
     bb_pos = None
     bbu, bbl = _last(bb_upper), _last(bb_lower)
     if bbu is not None and bbl is not None:
@@ -138,26 +150,54 @@ def compute_indicators(
         if rng > 0:
             bb_pos = (last_close - bbl) / rng
 
+    # Trend regime label (per Wilder + practitioner convention):
+    #   ADX > 25 → trending
+    #   ADX < 20 → ranging
+    #   20 ≤ ADX ≤ 25 → transitional
+    adx_last = _last(adx)
+    if adx_last is None:
+        adx_regime = None
+    elif adx_last > 25:
+        adx_regime = "trending"
+    elif adx_last < 20:
+        adx_regime = "ranging"
+    else:
+        adx_regime = "transitional"
+
     return {
         "lookbacks_used": {
             "rsi": int(lb["rsi"]),
+            "rsi_short": int(lb["rsi_short"]),
             "macd": [int(macd_fast), int(macd_slow), int(macd_signal)],
             "bbands": int(lb["bbands"]),
             "atr": int(lb["atr"]),
+            "adx": int(lb["adx"]),
             "ema_fast": int(lb["ema_fast"]),
             "ema_slow": int(ema_slow_period),
+            "volume_ma": int(lb["volume_ma"]),
         },
         "last_close": last_close,
+        # RSI
         "rsi": _last(rsi),
+        "rsi_short": _last(rsi_short),
+        # MACD
         "macd": _last(macd),
         "macd_signal": _last(macd_sig),
         "macd_hist": _last(macd_hist),
+        # Bollinger
         "bb_upper": _last(bb_upper),
         "bb_middle": _last(bb_middle),
         "bb_lower": _last(bb_lower),
         "bb_position": bb_pos,
+        # ATR
         "atr": _last(atr),
         "atr_pct": (_last(atr) / last_close) if _last(atr) else None,
+        # ADX (NEW)
+        "adx": adx_last,
+        "plus_di": _last(plus_di),
+        "minus_di": _last(minus_di),
+        "adx_regime": adx_regime,
+        # EMA
         "ema_fast": _last(ema_fast),
         "ema_slow": _last(ema_slow),
         "above_ema_slow": (
@@ -168,10 +208,16 @@ def compute_indicators(
             if _last(ema_fast) is not None and _last(ema_slow) is not None
             else None
         ),
+        # Volume (NEW)
+        "volume_last": last_vol,
+        "volume_ma": last_vol_ma,
+        "rel_volume": rel_volume,
+        # Series tails
         "series": {
             "close": _tail(close),
             "rsi": _tail(rsi),
             "macd_hist": _tail(macd_hist),
+            "adx": _tail(adx),
         },
     }
 

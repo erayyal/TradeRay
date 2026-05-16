@@ -1,430 +1,227 @@
-# TradeRay — Karar Algoritmaları (Algorithm Reference)
+# TradeRay — Karar Algoritması (v2, literatür-temelli)
 
-> Bu dosya: bot **şu anda** trade veya sinyali neye göre üretiyor?
-> Hem AI kapalı (saf rule engine) hem AI açık (rule engine + LLM verification)
-> modlarının davranışı, formülleri ve market başına farklılıkları aşağıda.
+> **Bu dosya: bot şu anda trade ve sinyali NEYE göre üretir?**
+> 14 Mayıs 2026'da `RESEARCH_ALGORITHM.md` araştırması yapıldı; bu dosya o
+> araştırmanın uygulanmış halidir. Önceki sürüm (`v1`, tek-evrensel-kural)
+> deprecate edildi.
 
-> Amaç: Gemini ile geliştirme planlamak için **mevcut durumun net referansı**.
-
----
-
-## 0. Sistem mimarisi tek paragrafta
-
-TradeRay **dual-core** bir karar motoru kullanır:
-
-1. **Rule Engine** (saf TA-Lib, deterministik, ücretsiz, hızlı).
-2. **AI Verification Layer** (Anthropic Claude — opsiyonel, market başına aç/kapat).
-
-Her sembol için her cycle:
-- Önce Rule Engine çalışır.
-- WAIT döndürürse → durur. **LLM hiç çağrılmaz.**
-- LONG/SHORT döndürürse:
-  - `use_ai = False` → Rule Engine kararı **direkt** karardır.
-  - `use_ai = True` → Master Trader LLM doğrular/reddeder/değiştirir.
-
-Bu yüzden her cycle'ın maliyeti şudur:
-
-| Senaryo | Maliyet |
-|---|---|
-| Rule WAIT, AI off | 0 token, ~1-2 sn |
-| Rule WAIT, AI on | 0 token (LLM çağrılmaz) |
-| Rule setup, AI off | 0 token |
-| Rule setup, AI on | 3 LLM çağrısı (Quant + Sentiment + Master) |
+> 🎓 = peer-reviewed academic | 🏛 = kurumsal araştırma | 🛠 = uygulayıcı
 
 ---
 
-## 1. Veri akışı (her cycle başı)
+## 0. Mimari özet
 
-Her sembol için sıralı şekilde çalışır:
+**Dual-core** + **market × term parameter matrisi**:
+
+1. **Rule Engine** (`agents/rule_engine.py` v2) — deterministik, free.
+   - Her (market × term) kombinasyonunun **kendi bias'ı + eşikleri + ATR çarpanları + risk %'si** var.
+   - 3 mod: **TF** (trend-following), **MR** (mean-reversion, Connors-stil), **HYB** (ADX-gated).
+2. **AI Verification Layer** — Anthropic Opus 4.7 (opsiyonel, per-market toggle).
+   - Sadece Rule Engine LONG/SHORT döndürürse çağrılır. WAIT'te 0 token.
+   - Master Trader rule_decision'ı **doğrular / değiştirir / reddeder**; market-spesifik rulebook prompt'a enjekte edilir.
+
+---
+
+## 1. Veri akışı (cycle başı)
 
 ```
 1. Symbol seç (Dynamic Screener — top 5 by 24h volume / daily move)
 2. OHLCV çek (Binance / yfinance)
-3. TA-Lib indikatörleri hesapla
-4. Rule Engine çalıştır → LONG / SHORT / WAIT
-5. (Opsiyonel) AI Layer → LONG / SHORT / WAIT / CANCEL_PENDING
-6. Engine route → DB'ye Signal yaz / borsaya emir gönder
-7. DecisionAudit'e tam düşünce zinciri kaydet
+3. TA-Lib indikatörleri hesapla (RSI/RSI(2)/MACD/BB/ATR/ADX/EMA/Vol-MA)
+4. Rule Engine — market × term policy table → LONG / SHORT / WAIT
+5. (Opsiyonel, use_ai=True ve setup varsa) AI Layer → final decision
+6. Engine route → strict TP/SL gate → DB / borsa
+7. DecisionAudit'e tam düşünce zinciri yaz
 ```
-
-### 1.1. Term → Primary Interval
-
-Karar verici timeframe (Rule Engine ve LLM'in odaklandığı):
-
-| Term | Primary Interval | Yardımcı Interval'lar |
-|---|---|---|
-| SCALP | **15m** | 5m + 15m |
-| SHORT_TERM | **4h** | 1h + 4h |
-| MID_TERM | **1d** | 1d |
-
-`SCALP` 5m'i texture/timing için kullanır, `SHORT_TERM` 1h'i alignment için.
-
-### 1.2. Dynamic TA-Lib Lookback'leri
-
-Interval'e göre indikatör periyotları **otomatik** değişir
-(`data_fetchers/market_fetcher.py:INDICATOR_LOOKBACKS`):
-
-| Interval | RSI | MACD | BBands | ATR | EMA fast | EMA slow |
-|---|---|---|---|---|---|---|
-| 5m | **9** | (8, 21, 5) | 20 | 14 | 21 | 100 |
-| 15m | 14 | (12, 26, 9) | 20 | 14 | 50 | 200 |
-| 1h | 14 | (12, 26, 9) | 20 | 14 | 50 | 200 |
-| 4h | 14 | (12, 26, 9) | 20 | 14 | 50 | 200 |
-| 1d | 14 | (12, 26, 9) | 20 | 14 | 50 | 200 |
-
-> 5m hariç hepsinde klasik textbook ayar.
 
 ---
 
-## 2. Rule Engine — kesin kararlar
+## 2. Rule Engine v2 — market × term parameter matrisi
 
-Konum: `agents/rule_engine.py:generate_rule_decision`
+Konum: `agents/rule_engine.py:PARAMS_TABLE` (her hücre `TermParams` dataclass'ı).
 
-### 2.1. Direction gate (kesin kurallar)
+### 2.1 CRYPTO (Binance USDT-M perpetuals)
 
-Primary interval üzerinde:
+| Term | Sinyal TF / Onay | Bias | RSI(period) eşikleri | ATR SL × | R:R | Risk | Lev | Vol gate | Atıf |
+|---|---|---|---|---|---|---|---|---|---|
+| **SCALP** | 15m / 1h | **MR** | RSI(2): ≤10 LONG, ≥90 SHORT | 1.0 | 1.5 | 2% | 3× | 1.2× | Connors-Alvarez 2008 🛠 |
+| **SHORT_TERM** | 4h / 1d | **HYB** | RSI(14): ≤35 / ≥65 | 1.5 | 2.0 | 2% | 3× | 1.2× | Wilder DMI 🛠 + MOP 2012 🎓 |
+| **MID_TERM** | 1d / — | **TF** | RSI(14): ≤40 / ≥60 + ADX>25 | 2.0 | 3.0 | 2% | 2× | 1.0× | MOP 2012, AMP 2013 🎓 |
 
-**LONG koşulu — HEPSİ aynı anda doğru olmalı:**
-- `RSI < 40`
-- `MACD histogram > 0`
-- `last_close > EMA_slow` (50 veya 200, interval'e göre)
-- **Multi-TF alignment bullish**: cycle'daki TÜM interval'lerin `above_ema_slow` değeri True
+### 2.2 SP500 & NASDAQ
 
-**SHORT koşulu — mirror:**
-- `RSI > 60`
-- `MACD histogram < 0`
-- `last_close < EMA_slow`
-- Multi-TF alignment bearish (hepsinde `above_ema_slow = False`)
+| Term | Sinyal TF / Onay | Bias | RSI eşikleri | ATR SL × | R:R | Risk | Lev | Vol gate |
+|---|---|---|---|---|---|---|---|---|
+| **SCALP** | 15m / 1h | **MR** | RSI(2): ≤5 / ≥95 (Connors original) | 1.0 | 1.5 | 2% | 1× | **1.5×** |
+| **SHORT_TERM** | 4h / 1d | **HYB** | RSI(14): ≤35 / ≥65 | 1.5 | 2.0 | 2% | 1× | 1.3× |
+| **MID_TERM** | 1d / — | **TF** | RSI(14): ≤40 / ≥60 + ADX>25 | 2.0 | 3.0 | 2% | 1× | 1.0× |
 
-**Aksi halde:** `WAIT` — neden WAIT döndüğü `justification`'a yazılır.
+### 2.3 BIST (.IS)
 
-### 2.2. Risk planı (TP/SL/sizing)
+| Term | Sinyal TF / Onay | Bias | RSI eşikleri | **ATR SL ×** | R:R | **Risk** | Lev | Vol gate |
+|---|---|---|---|---|---|---|---|---|
+| **SCALP** | 15m / 1h | MR | RSI(2): ≤10 / ≥90 | **2.0** | 1.5 | **1.5%** | 1× | 1.5× |
+| **SHORT_TERM** | 4h / 1d | HYB | RSI(14): ≤35 / ≥65 | **2.0** | 2.0 | **1.5%** | 1× | 1.3× |
+| **MID_TERM** | 1d / — | TF | RSI(14): ≤40 / ≥60 + ADX>25 | **2.5** | 3.0 | **1.5%** | 1× | 1.0× |
 
-Setup bulunduğunda **mutlaka** üretilir (yoksa engine reject eder):
+> **Neden BIST'te daha geniş stop + düşük risk?** TR equity'leri gap riski + mid/small-cap likidite + TCMB/USDTRY makro vol → AQR-style vol-targeting mantığı, IMF EM coupling literatürü.
+
+---
+
+## 3. Karar mantığı — bias'a göre
+
+### 3.1 MR (Mean-Reversion) mode — SCALP'in tek modu, HYB'in ranging dalı
+
+Tüm koşullar primary interval'da:
 
 ```
-ATR_SL_MULT  = 1.5     # Stop-loss distance in ATRs
-ATR_TP_MULT  = 3.0     # Take-profit distance in ATRs
-R:R = ATR_TP_MULT / ATR_SL_MULT = 2.0    (fixed)
-
 LONG:
-  entry  = last_close
-  stop_loss   = entry − 1.5 × ATR
-  take_profit = entry + 3.0 × ATR
-
-SHORT: mirror
-
-risk_per_unit  = |entry − stop_loss|              ( = 1.5 × ATR )
-max_risk_usd   = PORTFOLIO_NOTIONAL × MAX_RISK_PCT ( default $10000 × 2% = $200 )
-position_size  = max_risk_usd / risk_per_unit
-position_notional = entry × position_size
+  RSI(rsi_period) ≤ rsi_long_max          # Connors RSI(2)<10 ya da Wilder RSI(14)<30
+  AND  BB_position ≤ 0.2                  # fiyat alt banda yakın
+  AND  rel_volume ≥ rel_volume_min        # hacim onayı
+  AND  confirm_TF (1 üst TF) EMA üstünde  # daha yüksek TF trendde
 ```
+SHORT mirror.
 
-Yani **her trade $200 risk taşır**, R:R sabit **2:1**.
-
-### 2.3. Confidence heuristic
+### 3.2 TF (Trend-Following) mode — MID_TERM
 
 ```
-confidence = 60                                  # baseline
-+ 15  if (LONG ∧ RSI < 30)   or   (SHORT ∧ RSI > 70)   # deeper extreme
-+ 5   if |MACD_hist| > 0
-+ 10  always (alignment gate'i geçtiği için)
-cap at 95
+LONG:
+  price > EMA_slow                        # BLL 1992 trend filtresi
+  AND  MACD_hist > 0                      # momentum onayı
+  AND  ADX ≥ adx_min_for_trend (=25)      # rejim trend (Wilder DMI)
+  AND  rel_volume ≥ rel_volume_min
+  AND  RSI NOT overbought (anti-FOMO)     # extreme RSI = pullback bekle
 ```
+SHORT mirror (price<EMA_slow, MACD_hist<0).
 
-`confidence ≥ 70` ise AI moduyla chart (vision) gönderilir; altındaysa text-only.
+### 3.3 HYB (Hybrid, ADX-gated) — SHORT_TERM
 
-### 2.4. Strict TP/SL gate (zero-tolerance)
-
-`execution/engine.py:route()` içinde — Rule Engine veya AI ne dönerse dönsün:
-
-```python
-if action in ("LONG", "SHORT"):
-    if take_profit is None or stop_loss is None or entry is None:
-        return REJECTED  # DB'ye yazmaz, emir göndermez
+```
+if ADX ≥ 25:                              # TRENDING regime
+    pull-back-in-trend (RSI pullback + EMA filter + confirm TF)
+elif ADX ≤ 20:                            # RANGING regime
+    BB mean-reversion (MR evaluator)
+else:                                     # TRANSITIONAL (20<ADX<25)
+    WAIT                                  # Wilder folklor + practitioner consensus
 ```
 
 ---
 
-## 3. AI Verification Layer (use_ai=True iken)
+## 4. Risk planı (her bias için)
 
-Rule Engine `LONG/SHORT` döndürdüğünde devreye girer. 3 ajan paralel/sıralı çalışır:
+```
+risk_per_unit  = atr_sl_mult × ATR(14)
+max_risk_usd   = PORTFOLIO_NOTIONAL × risk_pct  (CRYPTO/US=2%, BIST=1.5%)
+size_base      = max_risk_usd / risk_per_unit
+notional_usd   = entry × size_base
+TP             = entry ± rr_target × risk_per_unit
+```
 
-### 3.1. Quant Analyst
-
-- **Input**: tüm interval'lerin indikatör snapshot'ları (RSI/MACD/BB/ATR/EMA + seri tail'leri), last_close.
-- **Çıktı (zorunlu JSON)**:
-  - `trend_bias`: bullish / bearish / neutral
-  - `trend_strength`: 0.0–1.0
-  - `momentum_state`: accelerating_up / decelerating_up / flat / decelerating_down / accelerating_down
-  - `key_levels`: { support, resistance }
-  - `volatility_state`: low / normal / elevated / extreme
-  - `atr_pct`: ATR / last_close
-  - `timeframe_alignment`: aligned_bullish / aligned_bearish / mixed / neutral
-  - `quant_score`: −1.0 to +1.0
-- **Tabu**: haber, sentiment, makro hakkında konuşamaz — sadece matematik.
-
-### 3.2. Sentiment Scanner
-
-- **Input**:
-  - News (RSS feed aggregator — CoinDesk, Cointelegraph, Decrypt, The Block, CryptoSlate, Bitcoin Magazine, CryptoPanic RSS)
-  - FRED makro (Fed Funds rate, US 10Y, T10Y2Y yield curve, VIX, DXY)
-  - DefiLlama on-chain (total TVL, ETH dominance)
-- **Mapping kuralları** (prompt'ta zorunlu):
-  - VIX > 20 ↑ → **risk_off**
-  - T10Y2Y < 0 (inverted curve) → **risk_off lean**
-  - DXY ↑ → **risk_off** (özellikle crypto/EM için)
-  - Fed cut cycle → **risk_on**
-- **Çıktı**:
-  - `fear_greed_index`: 0–100
-  - `macro_regime`: risk_on / neutral / risk_off
-  - `news_catalysts`: max 5 item, impact_tier'a göre sıralı
-  - `sentiment_score`: −1.0 to +1.0
-- **Tabu**: fiyat tahmini yapamaz, oy saymaz (headline impact > headline count).
-
-### 3.3. Master Trader (Beyin)
-
-Diğer iki ajanın çıktısını + microstructure + chart + market-spesifik rulebook'u birleştirir.
-
-**Input** (multi-block):
-- 🖼 IMAGE: candle + volume + EMA(20,50) chart (~120 mum, sadece `rule.confidence ≥ 70` ise)
-- 📋 JSON payload:
-  - `quant`, `sentiment` raporları
-  - `microstructure`: market'e göre
-    - **CRYPTO**: funding_rate (8h, annualized), open_interest (base + USD)
-    - **BIST**: USDTRY=X daily rate + günlük % değişim
-    - **SP500/NASDAQ**: boş (FRED zaten US makroyu veriyor)
-  - `pending_order`: bu sembolde unfilled limit varsa
-  - `risk_envelope`: portfolio_notional, max_risk_pct, max_leverage
-- 📚 SYSTEM PROMPT (market'e göre dinamik):
-  - `rules/crypto_strategy.md` ya da `rules/bist_strategy.md` ya da `rules/us_equities_strategy.md` enjekte edilir.
-
-**8 adımlı zorunlu CoT** (prompt'ta):
-1. Visual read (chart)
-2. Tape fusion (quant + sentiment + microstructure)
-3. Vision vs. numbers cross-check
-4. Rulebook harmonization
-5. Conflict gate
-6. Volatility & market-class gate
-7. Trade construction (entry/SL/TP)
-8. R:R verification (≥ 1.5)
-9. Confidence + sanity checks
-
-**Çıktı (strict JSON)**:
-- `decision`: LONG / SHORT / WAIT / **CANCEL_PENDING**
-- `confidence_level`: 0–100
-- `entry_price`, `take_profit`, `stop_loss`, `leverage`
-- `position_size_base`, `position_notional_usd`, `risk_usd`, `reward_risk_ratio`
-- `vision_confirms_quant`: bool
-- `chart_observations`, `rulebook_references`, `conflict_flags`
-- `justification`: 2-3 cümle — Rule Engine setup'ına ne yaptığını açıklar
-
-**Master Trader'ın yetkisi:**
-- Rule Engine'in LONG/SHORT setup'ını **reddedebilir** (WAIT'e çevirir)
-- TP/SL/Entry seviyelerini **değiştirebilir** (kendi planını üretir)
-- Pending limit order'ı **iptal edebilir** (`CANCEL_PENDING`)
-- Yeni LONG/SHORT karar verebilir (Rule farklı dese bile)
+`engine.route()` **strict TP/SL gate**'i — entry/TP/SL'den biri eksikse decision **DB'ye yazılmaz**, borsaya gitmez.
 
 ---
 
-## 4. Market başına farklılıklar
+## 5. Multi-timeframe alignment — KISITLI
 
-### 4.1. Rule Engine — market spesifik DEĞİL ❌
+Eski v1: "tüm interval'ler EMA tarafında aynı olmalı" → likely curve-fit.
 
-Şu an **aynı 4 kural** tüm marketlerde çalışıyor:
-- LONG/SHORT thresholds: RSI 40/60, MACD hist sign, EMA filter, multi-TF alignment
-- ATR-based TP/SL
-- Crypto/BIST/SP500/NASDAQ farkı yok
+**v2:** sadece **2 timeframe** (sinyal TF + onay TF), oran ~4-6×.
 
-**Bilinen eksiklikler:**
-- US SCALP'te RTH (09:30-16:00 ET) kontrolü yok
-- BIST'te USDTRY makro overlay yok
-- Earnings calendar guard yok
-- VIX guard yok
-- Crypto funding extremes filtresi yok
-
-### 4.2. AI Verification — market spesifik EVET ✅
-
-`build_master_trader_prompt(market)` her market için **farklı rulebook** enjekte ediyor:
-
-| Market | Rulebook | Vurgular |
+| Term | Sinyal | Onay |
 |---|---|---|
-| **CRYPTO** | `rules/crypto_strategy.md` | 24/7 microstructure, funding rate, OI divergence, BTC dominance, liquidity sweeps (ICT-style), Wyckoff schematics, Asia/EU/NY session davranışı, volatility regimes |
-| **BIST** | `rules/bist_strategy.md` | Tek seans + gap risk, **TL macro overlay** (USDTRY), inflation-hedged rallies, TCMB politika günleri, bilanço dönemi guard, BIST sektör davranışı (banks/holdings/industrial) |
-| **SP500 / NASDAQ** | `rules/us_equities_strategy.md` | RTH only, overnight gap risk, earnings calendar awareness (±2 session avoid), sector rotation by rates regime, **VIX master gauge**, ICT/SMC patterns (FVG, OB, BOS/CHoCH on 4h+) |
+| SCALP | 15m | 1h |
+| SHORT_TERM | 4h | 1d |
+| MID_TERM | 1d | (standalone) |
 
-**Yani:**
-- Crypto + AI off → universal rule engine
-- Crypto + AI on → Master Trader, crypto rulebook'la harmonize
-- BIST + AI on → Master Trader, BIST rulebook + USDTRY context
+Onay TF: yalnızca EMA-slow pozisyonu kontrol edilir (yön süzgeci). Daha karmaşık alignment kuralları PHASE 3'e bırakıldı (overfitting riski).
 
 ---
 
-## 5. CANCEL_PENDING — pending order invalidation
+## 6. AI Verification Layer (use_ai=True iken)
 
-**Sadece AI mode** — Master Trader'ın özel yetkisi.
+Rule Engine LONG/SHORT döndüğünde devreye girer. 3 paralel/sıralı LLM çağrısı:
 
-Rule Engine bunu üretemez (çünkü pending order context yok).
+| Ajan | Görev | Input |
+|---|---|---|
+| **Quant Analyst** | Salt matematiksel TA değerlendirmesi | Tüm interval'lerin indikatör snapshot'ları |
+| **Sentiment Scanner** | News + macro + on-chain sentez | RSS news, FRED macro, DefiLlama |
+| **Master Trader** | Karar: doğrula / değiştir / reddet | quant + sentiment + microstructure + chart (conf≥70) + **market-spesifik rulebook** |
 
-Master Trader bir sembolde unfilled limit order görürse:
-- Yapısal invalidation var mı? (Support break, regime flip, eski emir > 12h)
-- Varsa → `decision = "CANCEL_PENDING"` döner.
-- Orchestrator `tracker.cancel_pending_for_symbol()` çağırır.
-- Binance'da emir iptal edilir, Trade row `CANCELED`'a düşer.
+**Master Trader yetkileri:**
+- Rule setup'ı **WAIT'e çevirebilir** (chart contradicts numerical narrative).
+- Entry/TP/SL'yi **kendi planına göre değiştirebilir**.
+- Pending limit order'ı **iptal edebilir** (`CANCEL_PENDING`).
 
-**Layer 1 fallback**: 24 saat unfilled kalan limit otomatik iptal (zaman bazlı, AI'dan bağımsız).
-
----
-
-## 6. Execution & risk gate'leri
-
-`execution/engine.py:route()` katmanları:
-
-1. **Mode coercion**: BIST/SP500/NASDAQ için `AUTO_BOT` → `SIGNAL_ONLY`'e zorla düşürülür. **Sadece CRYPTO** gerçek emir gönderebilir.
-2. **Strict TP/SL gate**: LONG/SHORT decision'ında entry/TP/SL eksikse → REJECTED (DB'ye yazılmaz).
-3. **Risk Manager** (`execution/risk_manager.py`):
-   - LONG ordering: `sl < entry < tp`
-   - SHORT ordering: `tp < entry < sl`
-   - `risk_usd ≤ portfolio × max_risk_pct` (= %2)
-   - `reward_risk_ratio ≥ 1.5`
-   - `leverage ≤ DEFAULT_LEVERAGE` (= 3x)
-4. **Binance executor** (yalnız Crypto AUTO_BOT):
-   - Strict quantization (tickSize/stepSize), MIN_NOTIONAL kontrolü
-   - Tenacity retry (429, 5xx, network)
-   - Idempotent client_order_id (duplicate → recovery via `futures_get_order`)
-   - Bracket: Limit entry (GTC) + Stop-Market SL + Take-Profit-Market TP, hepsi `closePosition=True`
+**Token ekonomisi:** chart sadece `rule.confidence ≥ 70` ise gönderilir (~3K ekstra input token). Rule WAIT iken **LLM hiç çağrılmaz**.
 
 ---
 
-## 7. Karar akışı diyagramı
+## 7. v1 → v2 farkları
 
-```
-                        ┌─────────────────────────────┐
-                        │  Scheduler tick (SCALP=5dk, │
-                        │  SHORT=1sa, MID=1gün)       │
-                        └──────────────┬──────────────┘
-                                       ▼
-                          ┌────────────────────────┐
-                          │ Master switch (Redis)  │
-                          │ system_enabled = "1"?  │
-                          └──────────┬─────────────┘
-                                     │ no → STOP
-                                     ▼ yes
-                          ┌────────────────────────┐
-                          │ MarketConfig.enabled?  │
-                          └──────────┬─────────────┘
-                                     │ no → SKIP MARKET
-                                     ▼ yes
-                          ┌────────────────────────┐
-                          │ Symbols: screener vs   │
-                          │ static symbols_csv     │
-                          └──────────┬─────────────┘
-                                     ▼
-                          ┌────────────────────────┐
-                          │ Fetch OHLCV + compute  │
-                          │ indicators (free)      │
-                          └──────────┬─────────────┘
-                                     ▼
-                          ┌────────────────────────┐
-                          │ Rule Engine            │
-                          │ (RSI/MACD/EMA gates)   │
-                          └──────────┬─────────────┘
-                            ┌────────┴────────┐
-                            ▼                 ▼
-                        WAIT                LONG/SHORT
-                            │                 │
-                ┌───────────┘                 ▼
-                ▼                  ┌─────────────────────┐
-        ┌────────────────┐         │  use_ai?            │
-        │ engine.route() │         └──┬──────────────────┘
-        │  → WAITED      │            │ no → engine.route() → SIGNAL_SENT or REJECTED
-        │  audit log     │            │
-        └────────────────┘            ▼ yes
-                                ┌─────────────────────────────┐
-                                │ Quant + Sentiment (parallel)│
-                                │ + microstructure            │
-                                │ + chart (if conf ≥ 70)      │
-                                └──────────┬──────────────────┘
-                                           ▼
-                                ┌─────────────────────────┐
-                                │ Master Trader           │
-                                │ → final LONG/SHORT/WAIT │
-                                │   /CANCEL_PENDING       │
-                                └──────────┬──────────────┘
-                                           ▼
-                                  ┌────────────────┐
-                                  │ engine.route() │
-                                  │ → EXECUTED /   │
-                                  │   SIGNAL_SENT/ │
-                                  │   REJECTED     │
-                                  └────────┬───────┘
-                                           ▼
-                                  ┌────────────────┐
-                                  │ DecisionAudit  │
-                                  │ (full trace)   │
-                                  └────────────────┘
-```
+| Konu | v1 | v2 (literatür-temelli) |
+|---|---|---|
+| Tek ruleset her markete | ✓ | ❌ Market × term matrisi |
+| RSI eşiği | 40 / 60 (ampirik dayanak yok) | SCALP: RSI(2) 10/90 (Connors); SHORT/MID: RSI(14) 30-35/65-70 (Wilder) |
+| Multi-TF alignment | Tüm interval'ler agree | Sinyal TF + 1 onay TF |
+| Mod ayrımı | Yok (universal rule) | TF / MR / HYB — ADX rejim filtresi |
+| Volume confirmation | ❌ Yok | ✓ `rel_volume ≥ threshold` |
+| ATR SL/TP | 1.5×/3.0× sabit (R:R=2) | Term'a göre 1.0–2.5×, R:R 1.5–3.0 |
+| BIST risk farklı mı | ❌ Hayır | ✓ %1.5/trade, daha geniş ATR |
+| ADX rejim filtresi | ❌ Yok | ✓ TRENDING/RANGING/TRANSITIONAL |
+| Connors RSI(2) | ❌ | ✓ SCALP için |
 
 ---
 
-## 8. Mevcut sınırlamalar & geliştirme alanları
+## 8. Hâlâ eksikler (Phase 3 — sonraki büyük adım)
 
-### Rule Engine eksiklikleri
-- ❌ **Volume confirmation yok**: hacim filtresi olmadan breakout/breakdown güvenilmez.
-- ❌ **RTH check yok** (US/BIST için): tek-seans market'lerde saat dışı tetiklenmemeli.
-- ❌ **Earnings/Fed/CPI calendar guard yok**: makro print öncesi 30-60dk WAIT olmalı.
-- ❌ **Crypto funding rate threshold yok**: extreme funding'de kontrast (squeeze) sinyali alınmalı.
-- ❌ **Trailing stop yok**: pozisyon kar'a geçince SL breakeven'a çekilmiyor.
-- ❌ **Pyramiding kuralı yok**: aynı sembolde 1 trade üst sınırı zorlanmıyor.
-- ❌ **Equal-weight gate**: confidence < 70 ile confidence = 95 aynı sizing alıyor (max 2% her ikisi için).
-
-### AI Verification eksiklikleri
-- ⚠️ **Prompt cache hit rate ölçülmüyor**: log'da var ama optimize edilmedi.
-- ⚠️ **Master Trader veto oranı bilinmiyor**: kaç defa rule setup'ı reddediyor?
-- ⚠️ **Sentiment Scanner over-budgets**: max_tokens=3500, ortalama daha az kullanılsa daha hızlı.
-- ⚠️ **Vision şart mı?**: gerçekten confidence ≥ 70'te değer katıyor mu, A/B testi yok.
-
-### Market-spesifik eksiklikler
-- **BIST**: TCMB karar günü guard yok, USDTRY threshold (örn. %2 günlük hareket) Rule Engine'e bağlanmadı.
-- **US Equities**: VIX threshold (>25 ise WAIT lean), sektör rotation real-time signal yok.
-- **Crypto**: BTC dominance trend Rule Engine'e bağlı değil, sadece prompt'ta referans.
-
-### Backtest yok
-- Hiçbir kural canlı veriden ÖNCE backtest ile validate edilmedi.
-- Rule Engine'in 12 aylık geçmiş üzerindeki Sharpe / max DD bilinmiyor.
-
-### Time-of-day, day-of-week filters yok
-- Crypto 24/7 ama Asia-thin saatleri / hafta sonu davranışı modellenmedi.
-- BIST'te Cuma kapanış / Pazartesi açılış idiosyncrasies yok.
+- ❌ **Backtest framework** — `RESEARCH_ALGORITHM.md` §7'in tüm önerileri: walk-forward (Pardo), bootstrap permutation (Aronson), Deflated Sharpe (LdP 2014). Bu yapılmadan parametre değişiklikleri canlıda valide edilemez.
+- ❌ **Earnings calendar guard** (US) — Bernard-Thomas PEAD. Şu an Master Trader prompt'unda nüans olarak var, kodda gate yok.
+- ❌ **TCMB MPC takvimi** (BIST) — 13:00–17:00 PPK günü filtresi yok.
+- ❌ **VIX rejim gate** (US) — VIX>25 size halve, >35 veto. Şu an prompt seviyesinde.
+- ❌ **Crypto funding rate ekstrem gate** — payload'da var (microstructure), Master Trader görür, ama Rule Engine'de değil.
+- ❌ **Chandelier trailing exit** (MID_TERM) — sabit R:R yerine trailing.
+- ❌ **Vol-targeting position sizing** — sabit %2 yerine, asset'in 30-gün realized vol'una ters orantılı.
+- ❌ **Regime-switching model** (Markov 2-state) — yüksek-vol vs düşük-vol mode geçişleri.
 
 ---
 
-## 9. Konfigürasyon dosyaları — geliştirici için yol haritası
+## 9. Konfigürasyon — geliştirici için harita
 
-| Dosya | Değiştirilebilir parametreler |
+| Dosya | Parametre |
 |---|---|
-| `agents/rule_engine.py` | `ATR_SL_MULT`, `ATR_TP_MULT`, `RSI_LONG_MAX`, `RSI_SHORT_MIN` |
-| `agents/orchestrator.py` | `_VISION_CONFIDENCE_THRESHOLD` (chart eşiği), `LLM_PRICING` |
-| `data_fetchers/market_fetcher.py` | `INDICATOR_LOOKBACKS` (interval başına TA-Lib periyotları), `TERM_INTERVALS`, screener pool'ları |
-| `config/settings.py` | `MAX_RISK_PCT` (default 0.02), `DEFAULT_LEVERAGE` (default 3) |
-| `execution/risk_manager.py` | TP/SL ordering, R:R minimum (1.5), leverage cap |
-| `agents/prompts.py` | LLM system prompt'ları (XML-tagged) |
-| `rules/*.md` | Market-spesifik harmonize edilen "kitap" — Master Trader prompt'una enjekte edilir |
+| `agents/rule_engine.py` | `CRYPTO_PARAMS`, `EQUITY_US_PARAMS`, `BIST_PARAMS` — her hücre `TermParams` dataclass'ı |
+| `data_fetchers/technicals.py` | `DEFAULT_LOOKBACKS` (RSI/MACD/BB/ATR/ADX/EMA/volume_ma periyotları) |
+| `data_fetchers/market_fetcher.py` | `INDICATOR_LOOKBACKS` (interval başına override) |
+| `execution/risk_manager.py` | TP/SL ordering, R:R min (1.5), leverage cap |
+| `config/settings.py` | `MAX_RISK_PCT`, `DEFAULT_LEVERAGE`, `PORTFOLIO_NOTIONAL` |
+| `agents/prompts.py` | LLM system prompt'ları |
+| `rules/*.md` | Market-spesifik kural kitabı (Master Trader prompt'una enjekte) |
 
 ---
 
-## 10. Doğru sorulması gereken sorular (Gemini'ye sorarken)
+## 10. Akademik atıflar (kısa liste — tam liste `RESEARCH_ALGORITHM.md` §11'de)
 
-1. **Volume**: Rule Engine'e volume filtresi (örn. SMA(20) volume × 1.5) eklemek win-rate'i artırır mı?
-2. **Market regime detection**: ADX gibi trend strength indicator'u eklemek, range vs trending markette farklı kurallar uygulamak mantıklı mı?
-3. **Mean reversion vs trend continuation**: tek bir setup template her ikisinde de iyi çalışmaz — ikisini ayırmak gerekir mi?
-4. **Time-based gating**: günün hangi saatlerinde Rule Engine en yüksek başarıyı veriyor? (Audit verisi biriksin → analyze.)
-5. **Stop placement**: ATR yerine swing low/high mantıklı mı?
-6. **Position sizing**: %2 sabit risk yerine confidence-weighted (60% → 1%, 95% → 3%) test edilmeli mi?
-7. **AI agreement metric**: Master Trader rule decision'ı kaç % oranında onaylıyor? Bu metriği track edip Rule Engine kurallarını yeniden ayarlamak için kullanabilir miyiz?
-8. **Backtest framework**: Mevcut audit data'sı backtest replay için yeterli mi? (Cevap: hayır — entry/exit time'ları evet ama tarihsel mum verisi cache'lenmiyor.)
+🎓 **Peer-reviewed:**
+- Jegadeesh & Titman (1993) *JoF* — cross-sectional momentum
+- Asness, Moskowitz & Pedersen (2013) *JoF* — value & momentum everywhere
+- Moskowitz, Ooi & Pedersen (2012) *JFE* — time-series momentum
+- Brock, Lakonishok & LeBaron (1992) *JoF* — MA crossover validation
+- Sullivan, Timmermann & White (1999) *JoF* — data-snooping correction
+- Lo, Mamaysky & Wang (2000) *JoF* — TA foundations
+- Bernard & Thomas (1989) *J Acct Res* — PEAD
+- Whaley (2000, 2009) *JPM* — VIX
+- Lo (2004) *JPM* — Adaptive Markets Hypothesis
+- López de Prado (2018) — backtest pitfalls / Deflated Sharpe
+
+🛠 **Practitioner classics:**
+- Wilder (1978) — RSI, ATR, ADX/DMI orijinal kaynak
+- Connors & Alvarez (2008) — RSI(2) mean-reversion
+- Carver (2015) — *Systematic Trading*
+- Tharp (2008) — position sizing
+- Bollinger (2001) — Bollinger Bands
 
 ---
 
-> **Bu dosya canlı belge**. Geliştirme yaptıkça güncelle. Mevcut commit:
-> `git log -1 --pretty=format:'%h %s'`
+> **Canlı belge.** Her parameter tweak'i sonrası burayı + `RESEARCH_ALGORITHM.md`'yi
+> güncelle. Commit hash referansı: `git log -1 --pretty=format:'%h %s'`.

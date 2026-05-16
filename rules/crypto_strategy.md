@@ -6,6 +6,17 @@
 > trust your eyes — a "perfect" Wyckoff schematic that the price has
 > already invalidated is not a setup, it's confirmation bias.
 
+> **v2 update — literature-grounded baseline.** TradeRay's rule engine now
+> uses a market × term parameter matrix (see `RESEARCH_ALGORITHM.md` §9).
+> For Crypto the bias is:
+> - **SCALP (15m + 1h confirm)**: Connors-style **mean-reversion** —
+>   RSI(2)≤10 LONG / ≥90 SHORT, near BB tail, higher-TF trend filter.
+> - **SHORT_TERM (4h + 1d confirm)**: ADX-gated **hybrid** — ADX>25 trades
+>   pullbacks-in-trend; ADX<20 trades BB mean-reversion; transitional band → WAIT.
+> - **MID_TERM (1d)**: **trend-following** (price>EMA200, MACD positive,
+>   ADX>25). R:R target 3.0; Chandelier exit recommended (Phase 3).
+> Stops: 1.0×ATR (SCALP) / 1.5×ATR (SHORT) / 2.0×ATR (MID). Risk per trade 2%.
+
 ---
 
 ## 1. Market Microstructure (24/7, perpetual futures)

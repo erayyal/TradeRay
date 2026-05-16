@@ -7,6 +7,16 @@
 > Harmonize these references with the Quant Analyst output and what you
 > see on the chart.
 
+> **v2 update — literature-grounded baseline.** Same 3-mode rule engine.
+> US-specific tweaks: SCALP uses **RSI(2) at 5/95** (Connors original
+> thresholds, S&P empirically validated 2003-2010); **higher rel_volume
+> gate (1.5×)** because intraday equity noise demands more confirmation;
+> SHORT_TERM HYB respects PEAD (Bernard-Thomas 1989) — Master Trader
+> should flag **±1 trading day around known earnings as veto context**
+> (not yet enforced in code). VIX>25 should halve position size,
+> VIX>35 should veto new entries entirely (Whaley fear gauge research) —
+> currently this is a Master-Trader-prompt-only check.
+
 ---
 
 ## 1. Market Microstructure (RTH-only with significant pre/post-market)

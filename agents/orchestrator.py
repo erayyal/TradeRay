@@ -390,22 +390,40 @@ _VISION_CONFIDENCE_THRESHOLD: int = 70
 def _extract_indicator_snapshot(
     indicators: dict[str, dict], primary_iv: str
 ) -> dict[str, Any]:
-    """Pick the headline numbers from the indicator bundle for the audit row."""
+    """Pick the headline numbers from the indicator bundle for the audit row.
+
+    Includes the new ADX/regime/rel_volume/Connors-RSI(2) fields used by
+    the v2 rule engine so the Decision Trace tab can show what the engine
+    actually saw.
+    """
     primary = indicators.get(primary_iv) or {}
     return {
         "primary_interval": primary_iv,
         "intervals_used": list(indicators.keys()),
+        "last_close": primary.get("last_close"),
+        # RSI
         "rsi": primary.get("rsi"),
+        "rsi_short": primary.get("rsi_short"),          # Connors RSI(2)
+        # MACD
         "macd": primary.get("macd"),
         "macd_hist": primary.get("macd_hist"),
         "macd_signal": primary.get("macd_signal"),
+        # EMA
         "ema_fast": primary.get("ema_fast"),
         "ema_slow": primary.get("ema_slow"),
+        "above_ema_slow": primary.get("above_ema_slow"),
+        # ATR
         "atr": primary.get("atr"),
         "atr_pct": primary.get("atr_pct"),
-        "last_close": primary.get("last_close"),
-        "above_ema_slow": primary.get("above_ema_slow"),
+        # ADX regime (NEW)
+        "adx": primary.get("adx"),
+        "plus_di": primary.get("plus_di"),
+        "minus_di": primary.get("minus_di"),
+        "adx_regime": primary.get("adx_regime"),
+        # Bollinger
         "bb_position": primary.get("bb_position"),
+        # Volume (NEW)
+        "rel_volume": primary.get("rel_volume"),
     }
 
 

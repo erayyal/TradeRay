@@ -7,6 +7,16 @@
 > or ICT templates without translating them to a TL-denominated, single-
 > session, capital-controls-adjacent regime.
 
+> **v2 update — literature-grounded baseline.** BIST inherits the same
+> 3-mode rule engine but with **wider stops** (2.0–2.5× ATR vs 1.0–2.0× for
+> Crypto/US) and **lower per-trade risk (1.5%)** due to gap risk and
+> mid/small-cap liquidity profile. Carhart momentum + Fama-French/q-factor
+> models work on BIST (Borsa İstanbul Review benchmark studies); apply
+> momentum in MID_TERM via 12-1 month returns. **TCMB MPC day filter
+> (13:00–17:00 TR) is NOT YET ENFORCED in code** — flag it in your
+> reasoning if the timestamp falls in this window. Same applies to large
+> daily USDTRY moves (|Δ%|>2) which historically front-run BIST volatility.
+
 ---
 
 ## 1. Market Microstructure
