@@ -76,7 +76,9 @@ services:
     healthcheck:
       # main.py runs forever; the healthcheck just verifies the process is
       # actually executing python (not crash-looped). Real health is in logs.
-      test: ["CMD", "pgrep", "-f", "python main.py"]
+      # `pgrep` is not installed in python:3.11-slim — fall back to listing
+      # /proc and matching python in the cmdline. Stdlib only.
+      test: ["CMD", "python", "-c", "import os; assert any('python' in open(f'/proc/{p}/cmdline').read() for p in os.listdir('/proc') if p.isdigit())"]
       interval: 30s
       timeout: 5s
       retries: 3
