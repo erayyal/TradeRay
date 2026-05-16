@@ -40,6 +40,7 @@ from core.telegram_notifier import (
     is_configured as telegram_is_configured,
     notify_daily_digest,
 )
+from data_fetchers.fred_fetcher import fetch_fred
 from execution.tracker import (
     manage_stale_orders,
     sync_binance_orders,
@@ -78,6 +79,13 @@ TRACKER_INTERVAL_SECONDS: int = 5 * 60
 # cancel + replace SL orders. 30 minutes is plenty for MID_TERM (daily candle)
 # and SHORT_TERM (4h candle) trades; it'd be wasted bandwidth at 5 min.
 CHANDELIER_INTERVAL_SECONDS: int = 30 * 60
+
+# Macro snapshot refresh — independent of use_ai. The rule engine's VIX gate
+# (Whaley 2000/2009) reads `macro:fred` from Redis; without this background
+# refresh, rule-only mode would never see a VIX value and the gate would
+# silently no-op. 15 min cadence is plenty — FRED publishes daily and we
+# cache for 1h anyway.
+MACRO_REFRESH_INTERVAL_SECONDS: int = 15 * 60
 
 _MARKET_JOB_PREFIX = "market_cycle:"
 _TRACKER_JOB_PREFIX = "tracker:"
@@ -169,6 +177,20 @@ async def _tracker_stale_orders_job() -> None:
         log.info("scheduler.tracker.stale_done", **(result or {}))
     except Exception as e:
         log.exception("scheduler.tracker.stale_crashed", err=str(e))
+
+
+async def _macro_refresh_job() -> None:
+    """Background FRED refresh — keeps `macro:fred` warm for rule-only gates.
+
+    The Sentiment Scanner path already refreshes this when use_ai=True, but
+    rule-only markets never trigger that path. The VIX (US) and yield-curve
+    gates depend on it, so we refresh independently. Cheap (one HTTP call,
+    response is tiny) and gated by `settings.fred_api_key` inside fetch_fred.
+    """
+    try:
+        await fetch_fred()
+    except Exception as e:
+        log.exception("scheduler.macro_refresh_crashed", err=str(e))
 
 
 async def _tracker_chandelier_job() -> None:
@@ -297,15 +319,31 @@ def _configure_tracker_jobs(scheduler: AsyncIOScheduler) -> None:
         replace_existing=True,
     )
 
+    # Macro snapshot refresh — independent of use_ai flag so rule-only gates
+    # (VIX, yield curve) always have fresh data to read.
+    scheduler.add_job(
+        _macro_refresh_job,
+        trigger=IntervalTrigger(seconds=MACRO_REFRESH_INTERVAL_SECONDS),
+        id=f"{_TRACKER_JOB_PREFIX}macro_refresh",
+        name="Tracker: macro snapshot (FRED — VIX/DXY/curve)",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=120,
+        replace_existing=True,
+        next_run_time=datetime.now(timezone.utc),  # fire once immediately
+    )
+
     log.info(
         "scheduler.tracker_jobs_scheduled",
         interval_seconds=TRACKER_INTERVAL_SECONDS,
         chandelier_interval_seconds=CHANDELIER_INTERVAL_SECONDS,
+        macro_refresh_interval_seconds=MACRO_REFRESH_INTERVAL_SECONDS,
         jobs=[
             f"{_TRACKER_JOB_PREFIX}binance_orders",
             f"{_TRACKER_JOB_PREFIX}signal_resolution",
             f"{_TRACKER_JOB_PREFIX}stale_orders",
             f"{_TRACKER_JOB_PREFIX}chandelier",
+            f"{_TRACKER_JOB_PREFIX}macro_refresh",
         ],
     )
 
@@ -469,4 +507,5 @@ __all__ = [
     "TERM_INTERVAL_SECONDS",
     "TRACKER_INTERVAL_SECONDS",
     "CHANDELIER_INTERVAL_SECONDS",
+    "MACRO_REFRESH_INTERVAL_SECONDS",
 ]

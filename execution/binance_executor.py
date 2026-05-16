@@ -479,20 +479,15 @@ async def replace_stop_loss(
 
     c = await _client()
 
-    # 1. Cancel the existing SL leg (best-effort: it may have already filled).
-    if old_sl_order_id:
-        try:
-            await c.futures_cancel_order(symbol=symbol, orderId=old_sl_order_id)
-        except BinanceAPIException as e:
-            # -2011 (unknown order id) means it filled or was already canceled.
-            if e.code not in _NO_RETRY_CODES:
-                raise
-            log.info(
-                "execution.trail.old_sl_already_gone",
-                symbol=symbol, old_sl_order_id=old_sl_order_id, code=e.code,
-            )
+    # Order matters: place NEW SL first, THEN cancel the old one.
+    #
+    # Both legs are STOP_MARKET + closePosition=True — whichever triggers
+    # first closes the entire position; the second auto-cancels via reduce-only
+    # logic. This means the position is *always* covered by at least one SL,
+    # even if the cancel-then-place sequence fails halfway. The opposite order
+    # has a real window (typically <100ms but >0) where the position is naked.
 
-    # 2. Place the replacement SL with a fresh client_id.
+    # 1. Place the replacement SL with a fresh client_id.
     new_cid = f"traderay-trail-{uuid.uuid4().hex[:10]}"
     close_side = SIDE_SELL if side_long else SIDE_BUY
     new_order = await _create_order_idempotent(
@@ -505,6 +500,22 @@ async def replace_stop_loss(
         workingType="MARK_PRICE",
         newClientOrderId=new_cid,
     )
+
+    # 2. Cancel the old SL leg (best-effort: it may have already filled).
+    if old_sl_order_id:
+        try:
+            await c.futures_cancel_order(symbol=symbol, orderId=old_sl_order_id)
+        except BinanceAPIException as e:
+            # -2011 (unknown order id) means it filled or was already canceled.
+            # In that case the position is already closed; the new SL we just
+            # placed will reject on the next mark-price tick with reduce-only.
+            # That's fine — log loud and move on.
+            if e.code not in _NO_RETRY_CODES:
+                raise
+            log.info(
+                "execution.trail.old_sl_already_gone",
+                symbol=symbol, old_sl_order_id=old_sl_order_id, code=e.code,
+            )
     log.info(
         "execution.trail.sl_replaced",
         symbol=symbol, side=("LONG" if side_long else "SHORT"),
