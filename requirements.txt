@@ -55,3 +55,7 @@ streamlit>=1.39
 
 # --- Structured logging ---
 structlog>=24.4
+
+# --- Testing (dev) ---
+pytest>=8.0
+pytest-asyncio>=0.23
