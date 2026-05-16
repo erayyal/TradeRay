@@ -657,6 +657,52 @@ async def run_symbol_cycle(
     microstructure: dict[str, Any] = {}
     chart_b64: str | None = None
 
+    # Rule-only thesis-broken cancel — Layer 3 of staleness manager.
+    #
+    # If there's a PENDING entry order resting on the book AND the rule engine
+    # has flipped its conviction (either to WAIT or to the opposite direction),
+    # the original thesis is no longer valid: cancel the order rather than
+    # let it sit until the 24h TTL fires. This mirrors what the Master Trader's
+    # CANCEL_PENDING path does in AI mode, but works in rule-only mode too.
+    thesis_broken = False
+    if pending_order is not None:
+        pending_side = pending_order.get("side")  # "LONG"/"SHORT"
+        cur = rule_decision["decision"]
+        if cur == "WAIT" or (cur in ("LONG", "SHORT") and cur != pending_side):
+            thesis_broken = True
+
+    if thesis_broken:
+        log.info(
+            "orchestrator.rule_thesis_broken",
+            symbol=symbol, market=market.value,
+            pending_side=pending_order.get("side"),
+            new_rule_decision=rule_decision["decision"],
+            new_justification=(rule_decision.get("justification") or "")[:200],
+        )
+        canceled_n = await _safe(
+            f"cancel_thesis_broken:{symbol}",
+            cancel_pending_for_symbol(symbol, reason="rule_thesis_broken"),
+        ) or 0
+        trace["execution"]["thesis_cancel"] = {
+            "canceled_count": canceled_n,
+            "pending_side": pending_order.get("side"),
+            "new_rule_decision": rule_decision["decision"],
+        }
+        result = {
+            "signal_id": None,
+            "trade_id": pending_order["trade_id"],
+            "executed": False,
+            "effective_mode": execution_mode,
+            "reason": "rule_thesis_broken",
+            "canceled_count": canceled_n,
+        }
+        await _persist_audit(
+            market=market, symbol=symbol, use_ai=use_ai,
+            execution_mode=execution_mode, trace=trace,
+            decision=rule_decision, result=result,
+        )
+        return result
+
     if rule_decision["decision"] == "WAIT":
         # No setup — short-circuit. ZERO LLM cost in this branch (dominant case).
         log.info(

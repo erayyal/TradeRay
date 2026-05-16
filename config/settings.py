@@ -47,6 +47,11 @@ class Settings(BaseSettings):
     streamlit_port: int = 8501
     log_level: str = "INFO"
 
+    # LLM cost budget — daily USD ceiling. Telegram fires once when crossed.
+    # 0 disables the check entirely. Soft alarm only; the bot keeps running
+    # until the user toggles markets off manually.
+    llm_daily_budget_usd: float = 5.0
+
     @field_validator("symbols", mode="before")
     @classmethod
     def _split_symbols(cls, v):

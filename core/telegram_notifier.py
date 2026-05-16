@@ -220,6 +220,27 @@ async def notify_order_canceled(*, symbol: str, reason: str) -> None:
     await send_message(text)
 
 
+async def notify_cost_budget_alert(
+    *, daily_usd: float, budget_usd: float, top_agent: str | None = None
+) -> None:
+    """💸 LLM cost budget exceeded. Sent at most once per day.
+
+    Fires when the running daily LLM spend crosses the configured budget.
+    The orchestrator-side guard ensures we don't spam — see
+    `_check_cost_budget` in scheduler/jobs.py.
+    """
+    pct = (daily_usd / budget_usd * 100.0) if budget_usd else 0.0
+    extra = f"\nTop agent today: {_code(escape_md2(top_agent))}" if top_agent else ""
+    text = (
+        f"💸 *LLM Cost Budget Exceeded*\n"
+        f"Today: {_code(_fmt_signed_usd(daily_usd))} "
+        f"\\(_{pct:.0f}% of {_code(_fmt_signed_usd(budget_usd))}_\\)"
+        f"{extra}\n"
+        f"_AI verification will keep running until you toggle markets off_"
+    )
+    await send_message(text)
+
+
 async def notify_daily_digest(
     *,
     date_str: str,
@@ -267,4 +288,5 @@ __all__ = [
     "notify_signal_resolved",
     "notify_order_canceled",
     "notify_daily_digest",
+    "notify_cost_budget_alert",
 ]

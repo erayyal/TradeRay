@@ -167,11 +167,22 @@ def test_usdtry_normal_move_passes(monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_vol_target_disabled_returns_one():
-    p = CRYPTO_PARAMS[Term.SCALP]
+    """When `vol_target_annual=None`, multiplier is a clean 1.0 (no-op)."""
+    import dataclasses
+    p = dataclasses.replace(
+        CRYPTO_PARAMS[Term.SCALP], vol_target_annual=None
+    )
     mult, reason = _vol_targeted_multiplier(p, atr_pct=0.02)
-    if p.vol_target_annual is None:
-        assert mult == 1.0
-        assert "disabled" in reason
+    assert mult == 1.0
+    assert "disabled" in reason
+
+
+def test_vol_target_active_in_production_params():
+    """All shipped TermParams have vol-targeting ENABLED (Phase 3.5)."""
+    for term in Term:
+        assert CRYPTO_PARAMS[term].vol_target_annual is not None
+        assert EQUITY_US_PARAMS[term].vol_target_annual is not None
+        assert BIST_PARAMS[term].vol_target_annual is not None
 
 
 def test_vol_target_high_vol_shrinks_size():

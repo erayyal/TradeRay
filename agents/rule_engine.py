@@ -73,6 +73,38 @@ class TermParams:
     periods_per_year: int = 35040
 
 
+# Vol-targeting starting defaults (Carver 2015 §11; AQR/Harvey 2018).
+# These are the asset-class annualized vol *targets*. The engine compares this
+# to the asset's CURRENT realized vol (estimated from ATR_pct) and scales
+# position size by (target / realized), clamped to [0.5, 1.5]. The clamp
+# ensures vol-targeting can't whipsaw size by more than 50% in either direction.
+#
+# Reasoning:
+#   - Crypto perps run hot — 25% target leaves headroom for the asset's
+#     natural ~60-100% realized vol, so most coins get DOWN-sized (which
+#     is what we want for risk parity vs equity portfolios).
+#   - US equities: S&P 500 long-run realized vol ~16-18%, so 15% target
+#     gives a mild down-tilt on noisy weeks and slight up-tilt on calm ones.
+#   - BIST equities: TR equity realized vol structurally higher than G7
+#     (TL macro overlay, gap risk), so 20% target — wider than US.
+_VOL_TARGET_CRYPTO = 0.25
+_VOL_TARGET_US_EQUITY = 0.15
+_VOL_TARGET_BIST = 0.20
+
+# Periods-per-year for each signal interval. Crypto 24/7, US equity RTH (6.5h).
+# BIST RTH is 8h but we use the same equity convention for simplicity.
+_PPY_CRYPTO = {
+    "15m": 365 * 24 * 4,
+    "4h": 365 * 6,
+    "1d": 365,
+}
+_PPY_EQUITY = {
+    "15m": 252 * 26,           # ~26 15-min bars per US RTH session
+    "4h": 252 * 2,             # ~2 4-hour bars per session (approx.)
+    "1d": 252,
+}
+
+
 # CRYPTO — 24/7 perpetuals, leverage allowed
 CRYPTO_PARAMS: dict[Term, TermParams] = {
     Term.SCALP: TermParams(
@@ -82,6 +114,8 @@ CRYPTO_PARAMS: dict[Term, TermParams] = {
         atr_sl_mult=1.0, rr_target=1.5,
         leverage_cap=3, risk_pct=0.02,
         rel_volume_min=1.2,
+        vol_target_annual=_VOL_TARGET_CRYPTO,
+        periods_per_year=_PPY_CRYPTO["15m"],
     ),
     Term.SHORT_TERM: TermParams(
         signal_interval="4h", confirm_interval="1d",
@@ -90,6 +124,8 @@ CRYPTO_PARAMS: dict[Term, TermParams] = {
         atr_sl_mult=1.5, rr_target=2.0,
         leverage_cap=3, risk_pct=0.02,
         rel_volume_min=1.2,
+        vol_target_annual=_VOL_TARGET_CRYPTO,
+        periods_per_year=_PPY_CRYPTO["4h"],
     ),
     Term.MID_TERM: TermParams(
         signal_interval="1d", confirm_interval=None,
@@ -98,6 +134,8 @@ CRYPTO_PARAMS: dict[Term, TermParams] = {
         atr_sl_mult=2.0, rr_target=3.0,
         leverage_cap=2, risk_pct=0.02,
         rel_volume_min=1.0,
+        vol_target_annual=_VOL_TARGET_CRYPTO,
+        periods_per_year=_PPY_CRYPTO["1d"],
     ),
 }
 
@@ -110,6 +148,8 @@ EQUITY_US_PARAMS: dict[Term, TermParams] = {
         atr_sl_mult=1.0, rr_target=1.5,
         leverage_cap=1, risk_pct=0.02,
         rel_volume_min=1.5,                                    # equity intraday wants more confirmation
+        vol_target_annual=_VOL_TARGET_US_EQUITY,
+        periods_per_year=_PPY_EQUITY["15m"],
     ),
     Term.SHORT_TERM: TermParams(
         signal_interval="4h", confirm_interval="1d",
@@ -118,6 +158,8 @@ EQUITY_US_PARAMS: dict[Term, TermParams] = {
         atr_sl_mult=1.5, rr_target=2.0,
         leverage_cap=1, risk_pct=0.02,
         rel_volume_min=1.3,
+        vol_target_annual=_VOL_TARGET_US_EQUITY,
+        periods_per_year=_PPY_EQUITY["4h"],
     ),
     Term.MID_TERM: TermParams(
         signal_interval="1d", confirm_interval=None,
@@ -126,6 +168,8 @@ EQUITY_US_PARAMS: dict[Term, TermParams] = {
         atr_sl_mult=2.0, rr_target=3.0,
         leverage_cap=1, risk_pct=0.02,
         rel_volume_min=1.0,
+        vol_target_annual=_VOL_TARGET_US_EQUITY,
+        periods_per_year=_PPY_EQUITY["1d"],
     ),
 }
 
@@ -138,6 +182,8 @@ BIST_PARAMS: dict[Term, TermParams] = {
         atr_sl_mult=2.0, rr_target=1.5,
         leverage_cap=1, risk_pct=0.015,                        # BIST risk_pct lower (gap risk)
         rel_volume_min=1.5,
+        vol_target_annual=_VOL_TARGET_BIST,
+        periods_per_year=_PPY_EQUITY["15m"],
     ),
     Term.SHORT_TERM: TermParams(
         signal_interval="4h", confirm_interval="1d",
@@ -146,6 +192,8 @@ BIST_PARAMS: dict[Term, TermParams] = {
         atr_sl_mult=2.0, rr_target=2.0,
         leverage_cap=1, risk_pct=0.015,
         rel_volume_min=1.3,
+        vol_target_annual=_VOL_TARGET_BIST,
+        periods_per_year=_PPY_EQUITY["4h"],
     ),
     Term.MID_TERM: TermParams(
         signal_interval="1d", confirm_interval=None,
@@ -154,6 +202,8 @@ BIST_PARAMS: dict[Term, TermParams] = {
         atr_sl_mult=2.5, rr_target=3.0,                        # BIST mid-term widest stops
         leverage_cap=1, risk_pct=0.015,
         rel_volume_min=1.0,
+        vol_target_annual=_VOL_TARGET_BIST,
+        periods_per_year=_PPY_EQUITY["1d"],
     ),
 }
 

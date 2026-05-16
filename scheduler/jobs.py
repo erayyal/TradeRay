@@ -36,8 +36,12 @@ from sqlalchemy import select
 
 from agents.orchestrator import run_market_cycle
 from core.logger import get_logger
+from config import settings
+from core.redis_client import cache
 from core.telegram_notifier import (
+    fire,
     is_configured as telegram_is_configured,
+    notify_cost_budget_alert,
     notify_daily_digest,
 )
 from data_fetchers.fred_fetcher import fetch_fred
@@ -86,6 +90,11 @@ CHANDELIER_INTERVAL_SECONDS: int = 30 * 60
 # silently no-op. 15 min cadence is plenty — FRED publishes daily and we
 # cache for 1h anyway.
 MACRO_REFRESH_INTERVAL_SECONDS: int = 15 * 60
+
+# LLM cost budget check — every 30 min. Fires a Telegram alert at most once
+# per UTC day when the running spend crosses `settings.llm_daily_budget_usd`.
+# A Redis flag `cost:alert_fired:<YYYY-MM-DD>` debounces.
+COST_BUDGET_INTERVAL_SECONDS: int = 30 * 60
 
 _MARKET_JOB_PREFIX = "market_cycle:"
 _TRACKER_JOB_PREFIX = "tracker:"
@@ -177,6 +186,78 @@ async def _tracker_stale_orders_job() -> None:
         log.info("scheduler.tracker.stale_done", **(result or {}))
     except Exception as e:
         log.exception("scheduler.tracker.stale_crashed", err=str(e))
+
+
+async def _cost_budget_job() -> None:
+    """Sum today's LLM spend; fire one Telegram alert if it crosses budget.
+
+    Idempotency: a single Redis flag `cost:alert_fired:<YYYY-MM-DD>` (24h TTL)
+    debounces. The bot keeps trading either way — this is observability, not
+    an enforcement gate (enforcement would risk killing AI in the middle of
+    a setup the user wants verified).
+    """
+    budget = float(settings.llm_daily_budget_usd or 0.0)
+    if budget <= 0 or not telegram_is_configured():
+        return
+
+    from sqlalchemy import func as sqla_func, select as sqla_select
+
+    from models import LLMCostLog
+
+    today = datetime.now(timezone.utc).date()
+    day_start = datetime(today.year, today.month, today.day, tzinfo=timezone.utc)
+    flag_key = f"cost:alert_fired:{today.isoformat()}"
+
+    try:
+        already_fired = await cache.client.get(flag_key)
+        if already_fired:
+            return
+    except Exception as e:
+        log.debug("scheduler.cost_budget_flag_read_failed", err=str(e))
+
+    async with AsyncSessionLocal() as session:
+        total = (
+            await session.execute(
+                sqla_select(
+                    sqla_func.coalesce(
+                        sqla_func.sum(LLMCostLog.estimated_cost_usd), 0.0
+                    )
+                ).where(LLMCostLog.created_at >= day_start)
+            )
+        ).scalar() or 0.0
+
+        agent_row = (
+            await session.execute(
+                sqla_select(
+                    LLMCostLog.agent_label,
+                    sqla_func.sum(LLMCostLog.estimated_cost_usd).label("c"),
+                )
+                .where(LLMCostLog.created_at >= day_start)
+                .group_by(LLMCostLog.agent_label)
+                .order_by(sqla_func.sum(LLMCostLog.estimated_cost_usd).desc())
+                .limit(1)
+            )
+        ).first()
+        top_agent = agent_row[0] if agent_row else None
+
+    if total < budget:
+        log.debug(
+            "scheduler.cost_budget_ok",
+            today_usd=round(total, 4), budget_usd=budget,
+        )
+        return
+
+    log.warning(
+        "scheduler.cost_budget_exceeded",
+        today_usd=round(total, 4), budget_usd=budget, top_agent=top_agent,
+    )
+    fire(notify_cost_budget_alert(
+        daily_usd=total, budget_usd=budget, top_agent=top_agent,
+    ))
+    try:
+        await cache.client.set(flag_key, "1", ex=24 * 3600)
+    except Exception as e:
+        log.warning("scheduler.cost_budget_flag_write_failed", err=str(e))
 
 
 async def _macro_refresh_job() -> None:
@@ -333,17 +414,31 @@ def _configure_tracker_jobs(scheduler: AsyncIOScheduler) -> None:
         next_run_time=datetime.now(timezone.utc),  # fire once immediately
     )
 
+    # LLM cost budget — once-per-day alert when spend crosses ceiling.
+    scheduler.add_job(
+        _cost_budget_job,
+        trigger=IntervalTrigger(seconds=COST_BUDGET_INTERVAL_SECONDS),
+        id=f"{_TRACKER_JOB_PREFIX}cost_budget",
+        name="Tracker: LLM cost budget watchdog (daily ceiling)",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=120,
+        replace_existing=True,
+    )
+
     log.info(
         "scheduler.tracker_jobs_scheduled",
         interval_seconds=TRACKER_INTERVAL_SECONDS,
         chandelier_interval_seconds=CHANDELIER_INTERVAL_SECONDS,
         macro_refresh_interval_seconds=MACRO_REFRESH_INTERVAL_SECONDS,
+        cost_budget_interval_seconds=COST_BUDGET_INTERVAL_SECONDS,
         jobs=[
             f"{_TRACKER_JOB_PREFIX}binance_orders",
             f"{_TRACKER_JOB_PREFIX}signal_resolution",
             f"{_TRACKER_JOB_PREFIX}stale_orders",
             f"{_TRACKER_JOB_PREFIX}chandelier",
             f"{_TRACKER_JOB_PREFIX}macro_refresh",
+            f"{_TRACKER_JOB_PREFIX}cost_budget",
         ],
     )
 
@@ -508,4 +603,5 @@ __all__ = [
     "TRACKER_INTERVAL_SECONDS",
     "CHANDELIER_INTERVAL_SECONDS",
     "MACRO_REFRESH_INTERVAL_SECONDS",
+    "COST_BUDGET_INTERVAL_SECONDS",
 ]
