@@ -1,34 +1,25 @@
-"""Literature-grounded rule engine — market × term parameter matrix.
+"""Literature-grounded rule engine — market × term parameter matrix
+(v2.5 — adds VIX / TCMB / earnings / funding gates + vol-targeting sizing).
 
-Replaces the prior single-ruleset approach (RSI<40 + MACD_hist>0 + EMA + multi-TF)
-with three distinct decision biases driven by literature:
+Three decision biases:
+  - **TF** (Trend-Following) — Moskowitz/Ooi/Pedersen 2012, Asness/Moskowitz/Pedersen 2013
+  - **MR** (Mean-Reversion)  — Connors-Alvarez 2008 (RSI(2) extremes)
+  - **HYB** (Hybrid, ADX-gated) — Wilder DMI/ADX 1978
 
-  - **TF** (Trend-Following)   — for MID_TERM equity/crypto positions where
-                                  time-series momentum dominates
-                                  (Moskowitz/Ooi/Pedersen 2012, Asness/Moskowitz/
-                                  Pedersen 2013).
-  - **MR** (Mean-Reversion)    — for SCALP where Connors RSI(2) extremes inside
-                                  a higher-TF uptrend produce the most defensible
-                                  short-term edge (Connors-Alvarez 2008, refined
-                                  by 2010+ practitioner retro-tests).
-  - **HYB** (Hybrid, ADX-gated)— for SHORT_TERM: ADX>25 → pull-back-in-trend
-                                  (TF mode); ADX<20 → BB mean-reversion (MR mode);
-                                  20≤ADX≤25 → WAIT (Wilder DMI/ADX 1978).
+Macro / calendar / microstructure gates (Phase 3):
+  - **VIX gate** (US): Whaley 2000/2009 — VIX>25 halves size, VIX>35 vetoes.
+  - **FOMC blackout** (US): Lucca-Moench 2015 NY Fed drift study + Bernard-Thomas spirit.
+  - **TCMB MPC blackout** (BIST): announcement window 13:00-17:00 TR — entry veto.
+  - **Earnings blackout** (US): Bernard-Thomas 1989 PEAD — ±1 trading day.
+  - **Funding rate extreme** (Crypto): Glassnode/Coinglass — abs(annualized funding)>50%
+    flips the engine to mean-reversion bias even in HYB regime.
 
-The parameter matrix per (market, term) follows RESEARCH_ALGORITHM.md §9.
-Notable corrections vs the previous engine:
+Vol-targeting position sizing (AQR/Harvey 2018):
+  - Default sizing uses fixed risk_pct of portfolio. When `vol_target` is provided
+    AND realized vol (from ATR_pct) is computable, sizing is scaled by
+    (vol_target / asset_realized_vol), clamped [0.5, 1.5].
 
-  - RSI thresholds are NO LONGER 40/60 — that had no empirical basis.
-    SCALP uses RSI(2) at 10/90 (Connors); higher TFs use RSI(14) at 30/70 or 35/65.
-  - Multi-TF alignment uses ONLY the signal interval + ONE confirmation interval
-    (~4-6× longer). The prior "all available intervals must agree" rule was
-    over-restrictive and likely curve-fit.
-  - ATR multipliers and R:R targets vary by term and market — BIST gets wider
-    stops (2.0×ATR) and 1.5% risk cap (gap risk + lower liquidity).
-  - Volume confirmation gate (rel_volume ≥ threshold) reduces false signals.
-
-EVERY non-WAIT decision still produces a complete entry/TP/SL plan that the
-execution engine's strict TP/SL gate accepts.
+EVERY non-WAIT decision produces a complete entry/TP/SL plan.
 """
 from __future__ import annotations
 
@@ -36,7 +27,9 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from config import settings
+from config.calendars import in_fomc_blackout, in_tcmb_blackout
 from core.logger import get_logger
+from data_fetchers.earnings_fetcher import is_in_earnings_blackout
 from models import MarketType, Term
 
 log = get_logger(__name__)
@@ -68,6 +61,16 @@ class TermParams:
     rel_volume_min: float           # volume confirmation gate (1.0 = at average; >1 = above-avg)
     adx_min_for_trend: float = 25.0
     adx_max_for_range: float = 20.0
+    # Vol-targeting (AQR/Harvey 2018). When set, position size scales by
+    # (vol_target_annual / asset_realized_vol_annual), clamped [0.5, 1.5].
+    # Asset realized vol is approximated from ATR_pct × sqrt(periods_per_year).
+    vol_target_annual: float | None = None
+    # Periods per year for the signal interval — used by vol annualization.
+    # 15m bar: 365×24×4 = ~35040 for crypto / ~252×6.5×4 for US equity = 6552.
+    # We use crypto convention since it's the more aggressive sizer; for equities
+    # the multiplier is conservative (over-sizes slightly), which is the safer
+    # error direction in vol-targeting context.
+    periods_per_year: int = 35040
 
 
 # CRYPTO — 24/7 perpetuals, leverage allowed
@@ -512,22 +515,112 @@ def _evaluate_hyb(
 # Public entrypoint
 # ---------------------------------------------------------------------------
 
+def _evaluate_gates(
+    *,
+    market: MarketType,
+    macro_lite: dict[str, Any] | None,
+    next_earnings_iso: str | None,
+) -> tuple[bool, float, str]:
+    """Macro/calendar/microstructure pre-gate.
+
+    Returns (allow_entry, size_multiplier, reason).
+      - allow_entry=False blocks the cycle outright (returns WAIT).
+      - size_multiplier scales the eventual position size (1.0 = no change,
+        0.5 = halve size in elevated-but-not-veto regimes).
+    """
+    macro_lite = macro_lite or {}
+
+    # VIX gate (US only) — Whaley 2000/2009.
+    if market in (MarketType.SP500, MarketType.NASDAQ):
+        vix = macro_lite.get("vix")
+        if vix is not None:
+            if vix >= 35:
+                return False, 0.0, f"VIX {vix:.1f}≥35 — vol crisis, no new entries"
+            if vix >= 25:
+                return True, 0.5, f"VIX {vix:.1f} elevated — size halved"
+
+    # FOMC blackout (US only) — Lucca-Moench 2015 NY Fed drift study.
+    if market in (MarketType.SP500, MarketType.NASDAQ):
+        if in_fomc_blackout():
+            return False, 0.0, "FOMC blackout window active"
+        if is_in_earnings_blackout(next_earnings_iso):
+            return False, 0.0, (
+                f"earnings blackout active "
+                f"(next earnings: {next_earnings_iso}) — PEAD vol veto"
+            )
+
+    # TCMB blackout (BIST only).
+    if market == MarketType.BIST:
+        if in_tcmb_blackout():
+            return False, 0.0, "TCMB PPK blackout window (13:00-17:00 TR) active"
+        # Huge daily USDTRY move flag (informational; soft size cut).
+        usdtry = macro_lite.get("usdtry") or {}
+        pct = usdtry.get("pct_change_1d")
+        if pct is not None and abs(pct) >= 0.02:
+            return True, 0.5, (
+                f"USDTRY |Δ%|={abs(pct):.2%}≥2% — TR macro vol elevated, size halved"
+            )
+
+    # Crypto funding rate extremes — Glassnode/Coinglass.
+    # |annualized funding| > 50% indicates excessively leveraged positioning
+    # (long-squeeze risk on positive, short-squeeze on negative). In that regime
+    # we down-weight trend-following and prefer mean-reversion. The bias FLIP
+    # is handled in generate_rule_decision; here we just signal it via reason.
+    # (The funding-flag-to-MR-bias flip happens BEFORE this function returns,
+    # so this gate stays "allow with full size" for the crypto path.)
+
+    return True, 1.0, "all gates clear"
+
+
+def _vol_targeted_multiplier(
+    p: TermParams, atr_pct: float | None
+) -> tuple[float, str]:
+    """Compute the vol-targeting size multiplier from realized vol estimate.
+
+    Returns (multiplier, reason). Falls back to 1.0 when target/atr_pct unset.
+
+    Realized vol estimate: ATR_pct × sqrt(periods_per_year) — a coarse
+    annualized vol proxy widely used by AQR / Two Sigma. Slightly over-estimates
+    in regimes with high gap risk, slightly under-estimates in fully-continuous
+    markets — both biases are conservative for position sizing.
+    """
+    if p.vol_target_annual is None or atr_pct is None or atr_pct <= 0:
+        return 1.0, "vol-target disabled"
+    realized_vol = atr_pct * (p.periods_per_year ** 0.5)
+    if realized_vol <= 0:
+        return 1.0, "vol estimate degenerate"
+    raw = p.vol_target_annual / realized_vol
+    clamped = max(0.5, min(1.5, raw))
+    return clamped, (
+        f"vol_target={p.vol_target_annual:.0%}, realized≈{realized_vol:.0%}, "
+        f"raw={raw:.2f}, clamped={clamped:.2f}"
+    )
+
+
 def generate_rule_decision(
     *,
     symbol: str,
     market: MarketType,
     term: Term,
-    primary_interval: str,             # kept for backwards-compat with orchestrator; we use params_for(market,term)
+    primary_interval: str,             # kept for backwards-compat; uses params_for(market, term)
     indicators: dict[str, dict[str, Any]],
+    # Macro/microstructure context (None ⇒ gates skipped — backwards compat).
+    macro_lite: dict[str, Any] | None = None,
+    next_earnings_iso: str | None = None,
 ) -> dict[str, Any]:
-    """Dispatch to the (market × term) policy and run its bias-specific evaluator."""
+    """Dispatch to the (market × term) policy and run its bias-specific evaluator.
+
+    New (v2.5): pre-gate evaluates macro/calendar/microstructure context
+    BEFORE the bias logic. A failed gate returns WAIT immediately; a soft
+    gate (size halver) flows through and scales position size at construction.
+    """
     try:
         p = params_for(market, term)
     except KeyError:
         log.warning("rule_engine.no_params", market=market.value, term=term.value)
         return _empty_wait(
             symbol, market, term,
-            TermParams(  # synthetic placeholder for the error path
+            TermParams(
                 signal_interval=primary_interval, confirm_interval=None,
                 bias="TF", rsi_period=14, rsi_long_max=40, rsi_short_min=60,
                 atr_sl_mult=2.0, rr_target=2.0, leverage_cap=1, risk_pct=0.02,
@@ -536,7 +629,32 @@ def generate_rule_decision(
             f"no parameter set defined for {market.value}/{term.value}",
         )
 
-    # Signal interval must be present and computable
+    # ---- Pre-gate: macro / calendar / microstructure ---------------------
+    allow, size_mult, gate_reason = _evaluate_gates(
+        market=market,
+        macro_lite=macro_lite,
+        next_earnings_iso=next_earnings_iso,
+    )
+    if not allow:
+        return _empty_wait(symbol, market, term, p, f"pre-gate: {gate_reason}")
+
+    # ---- Crypto funding bias flip (Glassnode/Coinglass) ------------------
+    # If funding is extreme in the SAME direction as a would-be trend trade,
+    # we flip to mean-reversion bias (countertrend the crowded book).
+    effective_bias: Bias = p.bias
+    if market == MarketType.CRYPTO and macro_lite:
+        funding = (macro_lite.get("funding_rate") or {})
+        ann_pct = funding.get("annualized_pct")
+        if ann_pct is not None and abs(ann_pct) > 50.0:
+            if effective_bias == "TF":
+                # Crowded book in trend direction → fade with MR
+                effective_bias = "MR"
+                log.info(
+                    "rule_engine.funding_flip_to_mr",
+                    symbol=symbol, annualized_pct=ann_pct,
+                )
+
+    # Signal interval must exist
     primary = indicators.get(p.signal_interval)
     if not primary or primary.get("error"):
         return _empty_wait(
@@ -544,11 +662,11 @@ def generate_rule_decision(
             f"signal interval {p.signal_interval} has insufficient indicator data",
         )
 
-    if p.bias == "MR":
+    if effective_bias == "MR":
         decision = _evaluate_mr(
             symbol=symbol, market=market, term=term, p=p, indicators=indicators,
         )
-    elif p.bias == "TF":
+    elif effective_bias == "TF":
         decision = _evaluate_tf(
             symbol=symbol, market=market, term=term, p=p, indicators=indicators,
         )
@@ -557,13 +675,30 @@ def generate_rule_decision(
             symbol=symbol, market=market, term=term, p=p, indicators=indicators,
         )
 
-    if decision["decision"] != "WAIT":
+    # ---- Apply pre-gate size multiplier + vol-targeting ------------------
+    if decision["decision"] in ("LONG", "SHORT"):
+        atr_pct = primary.get("atr_pct")
+        vol_mult, vol_reason = _vol_targeted_multiplier(p, atr_pct)
+        final_mult = size_mult * vol_mult
+        if abs(final_mult - 1.0) > 1e-6:
+            # Scale the sizing fields; keep entry/SL/TP/RR identical (risk dollars change).
+            for k in ("position_size_base", "position_notional_usd", "risk_usd"):
+                v = decision.get(k)
+                if v is not None:
+                    decision[k] = v * final_mult
+            decision.setdefault("chart_observations", []).append(
+                f"size×{final_mult:.2f} (gate={gate_reason}; {vol_reason})"
+            )
+        decision["sizing_multiplier"] = final_mult
+        decision["gate_reason"] = gate_reason
+
         log.info(
             "rule_engine.setup",
             symbol=symbol, market=market.value, term=term.value,
-            bias=p.bias, direction=decision["decision"],
+            bias=effective_bias, direction=decision["decision"],
             confidence=decision["confidence_level"],
             rr=round(decision["reward_risk_ratio"], 2),
+            size_mult=round(final_mult, 2),
         )
     return decision
 

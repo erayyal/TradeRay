@@ -55,6 +55,7 @@ from config import settings
 from core.logger import get_logger
 from core.redis_client import cache
 from data_fetchers.defillama_fetcher import fetch_defillama
+from data_fetchers.earnings_fetcher import fetch_next_earnings_date
 from data_fetchers.fred_fetcher import fetch_fred
 from data_fetchers.market_fetcher import fetcher, lookbacks_for
 from data_fetchers.news_fetcher import fetch_latest_news
@@ -288,6 +289,31 @@ async def _run_sentiment(
         market=market, symbol=symbol, agent_label="sentiment", usage=usage,
     )
     return parsed
+
+
+async def _fetch_macro_lite(market: MarketType) -> dict[str, Any]:
+    """Cheap macro snapshot read DIRECTLY from Redis caches.
+
+    Unlike `_refresh_macro_context()` (which fetches FRED/RSS/DefiLlama for
+    the LLM pipeline), this only reads what's already in Redis from the last
+    macro refresh. The rule engine's VIX/USDTRY/funding gates need at-most-
+    1-hour-old data, which the scheduler's MACRO_SECONDS cycle keeps fresh.
+
+    Returns minimal dict — caller passes to rule_engine.generate_rule_decision.
+    Never raises; missing data ⇒ gates skip silently.
+    """
+    out: dict[str, Any] = {}
+    if market in (MarketType.SP500, MarketType.NASDAQ):
+        macro = await _safe("macro_lite_fred", cache.get_json("macro:fred"))
+        if macro:
+            out["vix"] = macro.get("vix")
+            out["dxy"] = macro.get("dxy")
+            out["yield_curve_10y2y"] = macro.get("yield_curve_10y2y")
+    if market == MarketType.BIST:
+        usdtry = await _safe("macro_lite_usdtry", fetcher.fetch_usdtry())
+        if usdtry:
+            out["usdtry"] = usdtry
+    return out
 
 
 async def _fetch_microstructure(
@@ -584,6 +610,24 @@ async def run_symbol_cycle(
     # Snapshot indicators for the audit row
     trace["indicators"] = _extract_indicator_snapshot(indicators, primary_iv)
 
+    # Pre-fetch macro-lite + earnings for the Rule Engine pre-gates.
+    # macro-lite reads CACHED FRED data → no extra LLM-pipeline cost.
+    # Earnings is yfinance + 24h Redis cache → at most one fetch per symbol/day.
+    macro_lite = await _fetch_macro_lite(market)
+    next_earnings: str | None = None
+    if market in (MarketType.SP500, MarketType.NASDAQ):
+        next_earnings = await _safe(
+            f"earnings:{symbol}", fetch_next_earnings_date(symbol)
+        )
+    # For Crypto, include funding rate in macro_lite so the bias-flip works
+    # in rule-only mode too (without the AI microstructure fetch path).
+    if market == MarketType.CRYPTO:
+        funding = await _safe(
+            f"funding_lite:{symbol}", fetcher.fetch_funding_rate(symbol)
+        )
+        if funding:
+            macro_lite["funding_rate"] = funding
+
     # 3. Pending-order lookup (need it for cache + master prompt)
     pending_order = await _safe(
         f"pending_lookup:{symbol}",
@@ -594,6 +638,7 @@ async def run_symbol_cycle(
     rule_decision = generate_rule_decision(
         symbol=symbol, market=market, term=term,
         primary_interval=primary_iv, indicators=indicators,
+        macro_lite=macro_lite, next_earnings_iso=next_earnings,
     )
     trace["rule_engine"] = {
         "decision": rule_decision["decision"],

@@ -431,8 +431,96 @@ async def execute_if_actionable(bundle: dict[str, Any]) -> dict[str, Any] | None
         return None
 
 
+# ---------------------------------------------------------------------------
+# Chandelier trailing-exit support — cancel + re-place the SL leg
+# ---------------------------------------------------------------------------
+
+async def replace_stop_loss(
+    *,
+    symbol: str,
+    side_long: bool,
+    old_sl_order_id: int | str | None,
+    new_sl_price: float,
+) -> dict[str, Any]:
+    """Atomically replace the SL leg of an OPEN position with a tighter one.
+
+    Used by the Chandelier trailing-exit tracker job. Returns the new order
+    dict (so callers can persist the new orderId + price).
+
+    The new SL keeps the same shape as the original entry-side SL leg:
+      - type=STOP_MARKET, closePosition=True, workingType=MARK_PRICE
+      - close_side = SELL for LONG / BUY for SHORT
+      - newClientOrderId tagged `traderay-trail-<uuid>` so retries are idempotent
+        and the lineage is visible in Binance UI.
+
+    Caller MUST hold the trade row; this function only talks to Binance.
+    """
+    filters = await _load_filters(symbol)
+    sl_q = _quantize_price(new_sl_price, filters)
+    _validate_filters(sl_q, qty=0.0, filters=filters) if False else None  # noqa: E711 — see comment below
+    # NOTE: we DO NOT call _validate_filters here because qty=0 always fails
+    # MIN_NOTIONAL. SL is a closePosition order — qty is implicit at execution.
+    # Price-side filters are still enforced via _quantize_price + the explicit
+    # PRICE_FILTER min/max check below.
+    price_prec = int(filters["pricePrecision"])
+    sl_str = _format_for_api(sl_q, price_prec)
+
+    pf = filters["PRICE_FILTER"]
+    min_price = float(pf.get("minPrice", 0) or 0)
+    max_price = float(pf.get("maxPrice", "inf") or "inf")
+    if min_price and sl_q < min_price:
+        raise BinanceFilterError(
+            f"new SL {sl_q} < PRICE_FILTER.minPrice {min_price}"
+        )
+    if max_price and sl_q > max_price:
+        raise BinanceFilterError(
+            f"new SL {sl_q} > PRICE_FILTER.maxPrice {max_price}"
+        )
+
+    c = await _client()
+
+    # 1. Cancel the existing SL leg (best-effort: it may have already filled).
+    if old_sl_order_id:
+        try:
+            await c.futures_cancel_order(symbol=symbol, orderId=old_sl_order_id)
+        except BinanceAPIException as e:
+            # -2011 (unknown order id) means it filled or was already canceled.
+            if e.code not in _NO_RETRY_CODES:
+                raise
+            log.info(
+                "execution.trail.old_sl_already_gone",
+                symbol=symbol, old_sl_order_id=old_sl_order_id, code=e.code,
+            )
+
+    # 2. Place the replacement SL with a fresh client_id.
+    new_cid = f"traderay-trail-{uuid.uuid4().hex[:10]}"
+    close_side = SIDE_SELL if side_long else SIDE_BUY
+    new_order = await _create_order_idempotent(
+        c,
+        symbol=symbol,
+        side=close_side,
+        type=FUTURE_ORDER_TYPE_STOP_MARKET,
+        stopPrice=sl_str,
+        closePosition=True,
+        workingType="MARK_PRICE",
+        newClientOrderId=new_cid,
+    )
+    log.info(
+        "execution.trail.sl_replaced",
+        symbol=symbol, side=("LONG" if side_long else "SHORT"),
+        old_sl_order_id=old_sl_order_id, new_sl_order_id=new_order.get("orderId"),
+        new_sl_price=sl_q,
+    )
+    return {
+        "order_id": new_order.get("orderId"),
+        "client_order_id": new_cid,
+        "stop_price": sl_q,
+    }
+
+
 __all__ = [
     "place_decision",
     "execute_if_actionable",
+    "replace_stop_loss",
     "BinanceFilterError",
 ]

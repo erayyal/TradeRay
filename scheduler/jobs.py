@@ -44,6 +44,7 @@ from execution.tracker import (
     manage_stale_orders,
     sync_binance_orders,
     sync_theoretical_signals,
+    update_chandelier_stops,
 )
 from models import (
     AsyncSessionLocal,
@@ -72,6 +73,11 @@ TERM_INTERVAL_SECONDS: dict[Term, int] = {
 # Tracker jobs all run on the same 5-minute heartbeat. Cheap, and frequent
 # enough that the UI's PnL numbers + active-order list stay current.
 TRACKER_INTERVAL_SECONDS: int = 5 * 60
+
+# Chandelier trailing exit runs less frequently — it touches the exchange to
+# cancel + replace SL orders. 30 minutes is plenty for MID_TERM (daily candle)
+# and SHORT_TERM (4h candle) trades; it'd be wasted bandwidth at 5 min.
+CHANDELIER_INTERVAL_SECONDS: int = 30 * 60
 
 _MARKET_JOB_PREFIX = "market_cycle:"
 _TRACKER_JOB_PREFIX = "tracker:"
@@ -163,6 +169,20 @@ async def _tracker_stale_orders_job() -> None:
         log.info("scheduler.tracker.stale_done", **(result or {}))
     except Exception as e:
         log.exception("scheduler.tracker.stale_crashed", err=str(e))
+
+
+async def _tracker_chandelier_job() -> None:
+    """Chandelier trailing-exit tightener (Chuck LeBeau).
+
+    Lower frequency than the other tracker jobs because it actually mutates
+    exchange state (cancel + place new SL). Idempotent: when nothing's worth
+    tightening, the function returns quickly with zero side effects.
+    """
+    try:
+        result = await update_chandelier_stops()
+        log.info("scheduler.tracker.chandelier_done", **(result or {}))
+    except Exception as e:
+        log.exception("scheduler.tracker.chandelier_crashed", err=str(e))
 
 
 # ---------------------------------------------------------------------------
@@ -265,13 +285,27 @@ def _configure_tracker_jobs(scheduler: AsyncIOScheduler) -> None:
         **common,
     )
 
+    # Chandelier runs on a slower cadence — exchange-mutating, MID/SHORT term only.
+    scheduler.add_job(
+        _tracker_chandelier_job,
+        trigger=IntervalTrigger(seconds=CHANDELIER_INTERVAL_SECONDS),
+        id=f"{_TRACKER_JOB_PREFIX}chandelier",
+        name="Tracker: Chandelier trailing-stop tightener (LeBeau)",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=60,
+        replace_existing=True,
+    )
+
     log.info(
         "scheduler.tracker_jobs_scheduled",
         interval_seconds=TRACKER_INTERVAL_SECONDS,
+        chandelier_interval_seconds=CHANDELIER_INTERVAL_SECONDS,
         jobs=[
             f"{_TRACKER_JOB_PREFIX}binance_orders",
             f"{_TRACKER_JOB_PREFIX}signal_resolution",
             f"{_TRACKER_JOB_PREFIX}stale_orders",
+            f"{_TRACKER_JOB_PREFIX}chandelier",
         ],
     )
 
@@ -434,4 +468,5 @@ __all__ = [
     "send_daily_digest",
     "TERM_INTERVAL_SECONDS",
     "TRACKER_INTERVAL_SECONDS",
+    "CHANDELIER_INTERVAL_SECONDS",
 ]

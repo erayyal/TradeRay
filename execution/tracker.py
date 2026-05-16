@@ -49,11 +49,14 @@ from core.telegram_notifier import (
     notify_trade_closed,
 )
 from data_fetchers.market_fetcher import fetcher as market_fetcher
+from data_fetchers.technicals import compute_indicators
+from execution.binance_executor import BinanceFilterError, replace_stop_loss
 from models import (
     AsyncSessionLocal,
     MarketType,
     Signal,
     SignalAction,
+    Term,
     Trade,
     TradeStatus,
 )
@@ -652,11 +655,200 @@ async def cancel_pending_for_symbol(
     return canceled
 
 
+# ---------------------------------------------------------------------------
+# Layer D: Chandelier trailing-exit (Chuck LeBeau)
+#
+# For OPEN trades whose underlying Signal is term=MID_TERM (or SHORT_TERM):
+#   exit = HighestHigh(N) − 3 × ATR(22)       on LONG (mirror on SHORT).
+# Stops are ratcheted ONE WAY ONLY — they can only tighten in the trade's
+# favour. If the new chandelier level is no better than the existing SL, we
+# leave the order untouched. This is the classic trend-following trailing-stop
+# formulation that lets winners run while preserving asymmetric R:R.
+#
+# Why not Binance's native TRAILING_STOP_MARKET? Their trailing percentage is
+# fixed at order-placement time; chandelier is volatility-adaptive (ATR
+# changes as the trade progresses). We re-compute server-side every 30 min,
+# cancel + replace the closePosition STOP_MARKET, and persist the new level.
+# ---------------------------------------------------------------------------
+
+_CHANDELIER_TRAIL_TERMS: frozenset[Term] = frozenset({Term.MID_TERM, Term.SHORT_TERM})
+_CHANDELIER_ATR_MULT: float = 3.0
+_CHANDELIER_ATR_PERIOD: int = 22
+
+
+def _chandelier_interval_for(term: Term) -> str:
+    """Daily candles for MID_TERM, 4h for SHORT_TERM.
+
+    Matches the rule engine's signal interval one step above the entry TF, so
+    the trailing stop reads the same regime the entry was based on.
+    """
+    if term == Term.MID_TERM:
+        return "1d"
+    return "4h"
+
+
+async def update_chandelier_stops() -> dict[str, int]:
+    """Walk every OPEN trade and tighten the SL if Chandelier says so.
+
+    Idempotent and ratchet-only:
+      - LONG  : new_sl = max(current_sl, highest_high_since_entry − 3×ATR)
+      - SHORT : new_sl = min(current_sl, lowest_low_since_entry   + 3×ATR)
+    A trade whose chandelier level hasn't improved is left alone (zero cost).
+
+    Returns counter dict for observability.
+    """
+    counts = {"checked": 0, "tightened": 0, "skipped_no_improvement": 0, "errors": 0}
+
+    async with AsyncSessionLocal() as session:
+        # Join trades → signals to filter by term in one query.
+        rows = (
+            await session.execute(
+                select(Trade, Signal)
+                .join(Signal, Trade.signal_id == Signal.id)
+                .where(
+                    Trade.status == TradeStatus.OPEN,
+                    Signal.term.in_(list(_CHANDELIER_TRAIL_TERMS)),
+                )
+            )
+        ).all()
+
+    if not rows:
+        return counts
+
+    log.info("tracker.chandelier.start", n=len(rows))
+
+    for trade, signal in rows:
+        counts["checked"] += 1
+        try:
+            outcome = await _trail_one_trade(trade, signal)
+            if outcome == "tightened":
+                counts["tightened"] += 1
+            elif outcome == "no_improvement":
+                counts["skipped_no_improvement"] += 1
+        except Exception as e:
+            counts["errors"] += 1
+            log.exception(
+                "tracker.chandelier.failed",
+                trade_id=trade.id, symbol=trade.symbol, err=str(e),
+            )
+
+    log.info("tracker.chandelier.done", **counts)
+    return counts
+
+
+async def _trail_one_trade(trade: Trade, signal: Signal) -> str | None:
+    """Compute the Chandelier level for one trade; cancel + replace SL if better."""
+    interval = _chandelier_interval_for(signal.term)
+
+    # Fetch enough candles to span entry → now + the ATR warmup window.
+    # 200 daily candles ≈ 6+ months, enough for ATR(22) + any reasonable hold.
+    candles = await market_fetcher.fetch_ohlcv(
+        trade.symbol, signal.market, interval, limit=200,
+    )
+    if not candles or len(candles) < _CHANDELIER_ATR_PERIOD + 2:
+        log.debug(
+            "tracker.chandelier.insufficient_candles",
+            symbol=trade.symbol, n=len(candles) if candles else 0,
+        )
+        return None
+
+    # ATR on the trailing interval — use a focused lookbacks dict so we don't
+    # waste time on RSI/MACD/etc. We still need enough bars for the indicator.
+    ind = compute_indicators(
+        candles,
+        lookbacks={"atr": _CHANDELIER_ATR_PERIOD},
+    )
+    if ind.get("error"):
+        log.debug(
+            "tracker.chandelier.indicators_failed", symbol=trade.symbol,
+            err=ind.get("error"),
+        )
+        return None
+    atr = ind.get("atr")
+    if not atr or atr <= 0:
+        return None
+
+    # Slice candles to those AFTER entry — the trail is anchored on the entry.
+    entry_ms = int(trade.created_at.timestamp() * 1000)
+    post_entry = [c for c in candles if c.get("close_time", 0) >= entry_ms]
+    if not post_entry:
+        # Not even one bar closed since entry — give the trade a chance.
+        return None
+
+    is_long = trade.side == "LONG"
+    if is_long:
+        anchor = max(c["high"] for c in post_entry)
+        chandelier_sl = anchor - _CHANDELIER_ATR_MULT * atr
+        # Don't trail beyond the current price — would be an instant-stop.
+        last_close = float(candles[-1]["close"])
+        chandelier_sl = min(chandelier_sl, last_close * 0.999)
+        # Ratchet: only raise the stop.
+        if chandelier_sl <= trade.stop_loss:
+            return "no_improvement"
+    else:
+        anchor = min(c["low"] for c in post_entry)
+        chandelier_sl = anchor + _CHANDELIER_ATR_MULT * atr
+        last_close = float(candles[-1]["close"])
+        chandelier_sl = max(chandelier_sl, last_close * 1.001)
+        if chandelier_sl >= trade.stop_loss:
+            return "no_improvement"
+
+    # Cancel old SL + place new STOP_MARKET via the executor.
+    bn_ids = dict(trade.binance_order_ids or {})
+    old_sl_id = bn_ids.get("sl")
+    try:
+        new = await replace_stop_loss(
+            symbol=trade.symbol,
+            side_long=is_long,
+            old_sl_order_id=old_sl_id,
+            new_sl_price=chandelier_sl,
+        )
+    except BinanceFilterError as e:
+        log.warning(
+            "tracker.chandelier.filter_rejected",
+            trade_id=trade.id, symbol=trade.symbol, err=str(e),
+        )
+        return None
+
+    # Persist new SL price + new orderId. Append to trail history for audit.
+    bn_ids["sl"] = new["order_id"]
+    trail_history = bn_ids.get("trail_history") or []
+    trail_history.append({
+        "at": datetime.now(timezone.utc).isoformat(),
+        "old_sl": trade.stop_loss,
+        "new_sl": new["stop_price"],
+        "anchor": anchor,
+        "atr": atr,
+        "interval": interval,
+    })
+    bn_ids["trail_history"] = trail_history[-25:]  # cap log size
+
+    async with AsyncSessionLocal() as session:
+        row = (
+            await session.execute(select(Trade).where(Trade.id == trade.id))
+        ).scalar_one_or_none()
+        if row is not None:
+            row.stop_loss = new["stop_price"]
+            row.binance_order_ids = bn_ids
+            flag_modified(row, "binance_order_ids")
+            await session.commit()
+
+    log.info(
+        "tracker.chandelier.tightened",
+        trade_id=trade.id, symbol=trade.symbol, side=trade.side,
+        old_sl=round(trade.stop_loss, 6) if trade.stop_loss else None,
+        new_sl=round(new["stop_price"], 6),
+        anchor=round(anchor, 6), atr=round(atr, 6),
+    )
+    return "tightened"
+
+
 __all__ = [
     "get_pending_trade_for_symbol",
     "sync_binance_orders",
     "sync_theoretical_signals",
     "manage_stale_orders",
+    "update_chandelier_stops",
     "cancel_trade",
     "cancel_pending_for_symbol",
 ]
