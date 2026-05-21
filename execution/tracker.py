@@ -44,6 +44,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from core.logger import get_logger
 from core.telegram_notifier import (
     fire,
+    notify_chandelier_tightened,
     notify_order_canceled,
     notify_signal_resolved,
     notify_trade_closed,
@@ -833,12 +834,22 @@ async def _trail_one_trade(trade: Trade, signal: Signal) -> str | None:
             flag_modified(row, "binance_order_ids")
             await session.commit()
 
+    old_sl_pre = trade.stop_loss  # snapshot before DB update wiped the original
     log.info(
         "tracker.chandelier.tightened",
         trade_id=trade.id, symbol=trade.symbol, side=trade.side,
-        old_sl=round(trade.stop_loss, 6) if trade.stop_loss else None,
+        old_sl=round(old_sl_pre, 6) if old_sl_pre else None,
         new_sl=round(new["stop_price"], 6),
         anchor=round(anchor, 6), atr=round(atr, 6),
+    )
+    fire(
+        notify_chandelier_tightened(
+            symbol=trade.symbol,
+            side=trade.side,
+            old_sl=float(old_sl_pre or 0.0),
+            new_sl=float(new["stop_price"]),
+            atr=float(atr),
+        )
     )
     return "tightened"
 

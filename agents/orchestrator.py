@@ -705,7 +705,8 @@ async def run_symbol_cycle(
 
     if rule_decision["decision"] == "WAIT":
         # No setup — short-circuit. ZERO LLM cost in this branch (dominant case).
-        log.info(
+        # DEBUG, not INFO: WAIT is the 95% case; INFO floods the log.
+        log.debug(
             "orchestrator.no_setup_wait", symbol=symbol, market=market.value,
             use_ai=use_ai,
         )
@@ -905,7 +906,16 @@ async def run_symbol_cycle(
         decision=decision, result=result,
     )
 
-    log.info(
+    # INFO only for actionable outcomes (LONG/SHORT/CANCEL_PENDING/executed).
+    # Pure WAITs go to DEBUG — they're 95% of cycles and were the main
+    # contributor to log bloat.
+    is_actionable = (
+        action in ("LONG", "SHORT", "CANCEL_PENDING")
+        or bool(result and result.get("executed"))
+        or bool(result and result.get("trade_id"))
+    )
+    _log = log.info if is_actionable else log.debug
+    _log(
         "orchestrator.symbol_done",
         symbol=symbol, market=market.value, decision=action,
         executed=bool(result and result.get("executed")),

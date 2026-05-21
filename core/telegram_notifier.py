@@ -220,6 +220,24 @@ async def notify_order_canceled(*, symbol: str, reason: str) -> None:
     await send_message(text)
 
 
+async def notify_chandelier_tightened(
+    *, symbol: str, side: str, old_sl: float, new_sl: float, atr: float,
+) -> None:
+    """🔧 [CRYPTO] TRAIL: BTCUSDT LONG SL 100.0 → 105.0 (ATR=2.1).
+
+    Fires when the Chandelier scheduler job ratchets a stop closer to
+    current price. Useful so the user knows their position is auto-locking
+    profit without having to refresh the dashboard.
+    """
+    arrow = "↑" if side == "LONG" else "↓"
+    text = (
+        f"🔧 *\\[CRYPTO\\] TRAIL: {escape_md2(symbol)} {escape_md2(side)}*\n"
+        f"SL {_code(f'{old_sl:.4f}')} {arrow} {_code(f'{new_sl:.4f}')} "
+        f"\\(ATR\\={_code(f'{atr:.4f}')}\\)"
+    )
+    await send_message(text)
+
+
 async def notify_cost_budget_alert(
     *, daily_usd: float, budget_usd: float, top_agent: str | None = None
 ) -> None:
@@ -289,4 +307,5 @@ __all__ = [
     "notify_order_canceled",
     "notify_daily_digest",
     "notify_cost_budget_alert",
+    "notify_chandelier_tightened",
 ]

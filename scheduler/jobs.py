@@ -544,6 +544,17 @@ async def send_daily_digest() -> None:
 
     date_str = start_tr.strftime("%Y-%m-%d")  # TR-local date label
 
+    # Quiet-mode: if literally nothing happened, skip the Telegram message.
+    # "0 trades / 0 signals" notifications are pure noise; the user already
+    # checks the dashboard when they want a status read. Still log the
+    # decision so we know the job ran (and can prove it on review days).
+    if len(trades) == 0 and not summary:
+        log.info(
+            "scheduler.digest.skipped_empty",
+            date=date_str, tz="Europe/Istanbul",
+        )
+        return
+
     await notify_daily_digest(
         date_str=date_str,
         crypto_pnl=crypto_pnl,

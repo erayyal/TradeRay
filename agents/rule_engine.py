@@ -105,35 +105,47 @@ _PPY_EQUITY = {
 }
 
 
+# Thresholds below were LOOSENED in v2.7 (2026-05-21) — backtest smoke test
+# showed pre-v2.7 SHORT_TERM 4h produced 0 setups in 1500 bars, and SIGNAL_ONLY
+# observation mode would never collect data. v2.7 is "observation-grade": more
+# permissive thresholds so we get a real signal stream; AUTO_BOT still gated
+# by §11 (paper-trade + walk-forward sweep).
+#
+# Changes vs v2.6 (annotated inline as `# v2.7`).
+
+
 # CRYPTO — 24/7 perpetuals, leverage allowed
 CRYPTO_PARAMS: dict[Term, TermParams] = {
     Term.SCALP: TermParams(
         signal_interval="15m", confirm_interval="1h",
         bias="MR",
-        rsi_period=2, rsi_long_max=10.0, rsi_short_min=90.0,   # Connors RSI(2)
+        rsi_period=2, rsi_long_max=15.0, rsi_short_min=85.0,   # v2.7: 10/90 → 15/85
         atr_sl_mult=1.0, rr_target=1.5,
         leverage_cap=3, risk_pct=0.02,
-        rel_volume_min=1.2,
+        rel_volume_min=1.0,                                    # v2.7: 1.2 → 1.0
         vol_target_annual=_VOL_TARGET_CRYPTO,
         periods_per_year=_PPY_CRYPTO["15m"],
     ),
     Term.SHORT_TERM: TermParams(
         signal_interval="4h", confirm_interval="1d",
         bias="HYB",
-        rsi_period=14, rsi_long_max=35.0, rsi_short_min=65.0,
+        rsi_period=14, rsi_long_max=40.0, rsi_short_min=60.0,  # v2.7: 35/65 → 40/60
         atr_sl_mult=1.5, rr_target=2.0,
         leverage_cap=3, risk_pct=0.02,
-        rel_volume_min=1.2,
+        rel_volume_min=1.0,                                    # v2.7: 1.2 → 1.0
+        adx_min_for_trend=22.0,                                # v2.7: 25 → 22
+        adx_max_for_range=18.0,                                # v2.7: 20 → 18 (wider trans. band)
         vol_target_annual=_VOL_TARGET_CRYPTO,
         periods_per_year=_PPY_CRYPTO["4h"],
     ),
     Term.MID_TERM: TermParams(
         signal_interval="1d", confirm_interval=None,
         bias="TF",
-        rsi_period=14, rsi_long_max=40.0, rsi_short_min=60.0,
+        rsi_period=14, rsi_long_max=45.0, rsi_short_min=55.0,  # v2.7: 40/60 → 45/55
         atr_sl_mult=2.0, rr_target=3.0,
         leverage_cap=2, risk_pct=0.02,
-        rel_volume_min=1.0,
+        rel_volume_min=0.9,                                    # v2.7: 1.0 → 0.9
+        adx_min_for_trend=22.0,                                # v2.7: 25 → 22
         vol_target_annual=_VOL_TARGET_CRYPTO,
         periods_per_year=_PPY_CRYPTO["1d"],
     ),
@@ -144,30 +156,33 @@ EQUITY_US_PARAMS: dict[Term, TermParams] = {
     Term.SCALP: TermParams(
         signal_interval="15m", confirm_interval="1h",
         bias="MR",
-        rsi_period=2, rsi_long_max=5.0, rsi_short_min=95.0,    # Connors original
+        rsi_period=2, rsi_long_max=10.0, rsi_short_min=90.0,   # v2.7: 5/95 → 10/90 (less strict than Connors)
         atr_sl_mult=1.0, rr_target=1.5,
         leverage_cap=1, risk_pct=0.02,
-        rel_volume_min=1.5,                                    # equity intraday wants more confirmation
+        rel_volume_min=1.2,                                    # v2.7: 1.5 → 1.2
         vol_target_annual=_VOL_TARGET_US_EQUITY,
         periods_per_year=_PPY_EQUITY["15m"],
     ),
     Term.SHORT_TERM: TermParams(
         signal_interval="4h", confirm_interval="1d",
         bias="HYB",
-        rsi_period=14, rsi_long_max=35.0, rsi_short_min=65.0,
+        rsi_period=14, rsi_long_max=40.0, rsi_short_min=60.0,  # v2.7: 35/65 → 40/60
         atr_sl_mult=1.5, rr_target=2.0,
         leverage_cap=1, risk_pct=0.02,
-        rel_volume_min=1.3,
+        rel_volume_min=1.0,                                    # v2.7: 1.3 → 1.0
+        adx_min_for_trend=22.0,                                # v2.7: 25 → 22
+        adx_max_for_range=18.0,                                # v2.7: 20 → 18
         vol_target_annual=_VOL_TARGET_US_EQUITY,
         periods_per_year=_PPY_EQUITY["4h"],
     ),
     Term.MID_TERM: TermParams(
         signal_interval="1d", confirm_interval=None,
         bias="TF",
-        rsi_period=14, rsi_long_max=40.0, rsi_short_min=60.0,
+        rsi_period=14, rsi_long_max=45.0, rsi_short_min=55.0,  # v2.7: 40/60 → 45/55
         atr_sl_mult=2.0, rr_target=3.0,
         leverage_cap=1, risk_pct=0.02,
-        rel_volume_min=1.0,
+        rel_volume_min=0.9,                                    # v2.7: 1.0 → 0.9
+        adx_min_for_trend=22.0,                                # v2.7: 25 → 22
         vol_target_annual=_VOL_TARGET_US_EQUITY,
         periods_per_year=_PPY_EQUITY["1d"],
     ),
@@ -178,30 +193,33 @@ BIST_PARAMS: dict[Term, TermParams] = {
     Term.SCALP: TermParams(
         signal_interval="15m", confirm_interval="1h",
         bias="MR",
-        rsi_period=2, rsi_long_max=10.0, rsi_short_min=90.0,
+        rsi_period=2, rsi_long_max=15.0, rsi_short_min=85.0,   # v2.7: 10/90 → 15/85
         atr_sl_mult=2.0, rr_target=1.5,
-        leverage_cap=1, risk_pct=0.015,                        # BIST risk_pct lower (gap risk)
-        rel_volume_min=1.5,
+        leverage_cap=1, risk_pct=0.015,
+        rel_volume_min=1.2,                                    # v2.7: 1.5 → 1.2
         vol_target_annual=_VOL_TARGET_BIST,
         periods_per_year=_PPY_EQUITY["15m"],
     ),
     Term.SHORT_TERM: TermParams(
         signal_interval="4h", confirm_interval="1d",
         bias="HYB",
-        rsi_period=14, rsi_long_max=35.0, rsi_short_min=65.0,
+        rsi_period=14, rsi_long_max=40.0, rsi_short_min=60.0,  # v2.7: 35/65 → 40/60
         atr_sl_mult=2.0, rr_target=2.0,
         leverage_cap=1, risk_pct=0.015,
-        rel_volume_min=1.3,
+        rel_volume_min=1.0,                                    # v2.7: 1.3 → 1.0
+        adx_min_for_trend=22.0,                                # v2.7: 25 → 22
+        adx_max_for_range=18.0,                                # v2.7: 20 → 18
         vol_target_annual=_VOL_TARGET_BIST,
         periods_per_year=_PPY_EQUITY["4h"],
     ),
     Term.MID_TERM: TermParams(
         signal_interval="1d", confirm_interval=None,
         bias="TF",
-        rsi_period=14, rsi_long_max=40.0, rsi_short_min=60.0,
+        rsi_period=14, rsi_long_max=45.0, rsi_short_min=55.0,  # v2.7: 40/60 → 45/55
         atr_sl_mult=2.5, rr_target=3.0,                        # BIST mid-term widest stops
         leverage_cap=1, risk_pct=0.015,
-        rel_volume_min=1.0,
+        rel_volume_min=0.9,                                    # v2.7: 1.0 → 0.9
+        adx_min_for_trend=22.0,                                # v2.7: 25 → 22
         vol_target_annual=_VOL_TARGET_BIST,
         periods_per_year=_PPY_EQUITY["1d"],
     ),
