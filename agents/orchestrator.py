@@ -922,14 +922,27 @@ async def run_symbol_cycle(
 async def _resolve_symbols(market_config: MarketConfig) -> list[str]:
     """Pick the universe of symbols for this cycle.
 
-    If the dynamic screener is ON in Redis, ask the screener for the top-N
-    "fırsat avcılığı" picks (top crypto by 24h volume / top equities by
-    abs daily move). Otherwise use the configured `symbols_csv` list.
+    Resolution order (fail-safe):
+      1. Dynamic screener ON in Redis → top-N "fırsat avcılığı" picks.
+      2. Otherwise, static `symbols_csv` list.
+      3. If BOTH the screener is off AND `symbols_csv` is empty (a config
+         hole that's easy to leave behind after a Redis wipe / fresh seed),
+         we fall back to the screener anyway — better to do something
+         useful than silently no-op every cycle. Logged loudly so the
+         operator notices.
     """
     static_symbols = market_config.symbols
     screener_on = await _read_screener_flag(market_config.market)
+
     if not screener_on:
-        return static_symbols
+        if static_symbols:
+            return static_symbols
+        log.warning(
+            "orchestrator.symbols_fallback_to_screener",
+            market=market_config.market.value,
+            reason="screener_off_and_static_empty",
+        )
+        # fall through to the screener path
 
     picks = await _safe(
         f"screener:{market_config.market.value}",
