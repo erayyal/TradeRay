@@ -17,6 +17,7 @@ orchestrator passes the dict from `market_fetcher.lookbacks_for(iv)`.
 """
 from __future__ import annotations
 
+import time
 from typing import Any, List, Sequence
 
 import numpy as np
@@ -94,6 +95,16 @@ def compute_indicators(
     """
     lb = _merge_lookbacks(lookbacks)
     min_bars = _min_required_bars(lb)
+
+    # Drop the still-open last bar so indicators reflect closed-bar state.
+    # Why: Binance returns the currently-forming bar with a `close_time` in
+    # the future and a partial `volume`. Computing rel_volume = last_vol /
+    # SMA(20, vol) on that bar produces ~0, which trips the volume gate on
+    # every cycle and is the root cause of "0 signals for a week".
+    if candles:
+        last_close_ms = candles[-1].get("close_time")
+        if last_close_ms is not None and last_close_ms > int(time.time() * 1000):
+            candles = candles[:-1]
 
     if len(candles) < min_bars:
         return {"error": "insufficient_data", "n": len(candles), "min_required": min_bars}
