@@ -119,11 +119,26 @@ _BINANCE_INTERVAL: dict[str, str] = {
 
 
 class _BinanceAdapter:
-    """Thin async wrapper around python-binance — single shared client."""
+    """Thin async wrapper around python-binance.
+
+    Two clients are kept side-by-side:
+      - `client()`       → respects `settings.binance_testnet`; used by the
+                            executor for ORDER PLACEMENT (so paper trading
+                            stays on testnet).
+      - `read_client()`  → always mainnet, no API key required; used for
+                            klines / 24h ticker / funding / OI. Testnet's
+                            market data is sparse and untrustworthy (often
+                            ~0 volume), which silently broke the rule
+                            engine's volume gate; mainnet public endpoints
+                            give real data while keeping order placement
+                            sandboxed.
+    """
 
     def __init__(self) -> None:
         self._client: AsyncClient | None = None
+        self._read_client: AsyncClient | None = None
         self._lock = asyncio.Lock()
+        self._read_lock = asyncio.Lock()
 
     async def client(self) -> AsyncClient:
         if self._client is None:
@@ -137,16 +152,30 @@ class _BinanceAdapter:
                     log.info("market.binance.connected", testnet=settings.binance_testnet)
         return self._client
 
+    async def read_client(self) -> AsyncClient:
+        """Mainnet read-only client. No API key — public endpoints only."""
+        if self._read_client is None:
+            async with self._read_lock:
+                if self._read_client is None:
+                    self._read_client = await AsyncClient.create(
+                        api_key="", api_secret="", testnet=False,
+                    )
+                    log.info("market.binance.read_connected", testnet=False)
+        return self._read_client
+
     async def close(self) -> None:
         if self._client is not None:
             await self._client.close_connection()
             self._client = None
+        if self._read_client is not None:
+            await self._read_client.close_connection()
+            self._read_client = None
 
     async def fetch(self, symbol: str, interval: str, limit: int = 300) -> list[dict]:
         bn = _BINANCE_INTERVAL.get(interval)
         if bn is None:
             raise ValueError(f"binance: unsupported interval {interval!r}")
-        c = await self.client()
+        c = await self.read_client()
         raw = await c.futures_klines(symbol=symbol, interval=bn, limit=limit)
         return [
             {
@@ -165,7 +194,7 @@ class _BinanceAdapter:
         self, limit: int, *, quote: str = "USDT", min_quote_volume: float = 1e7
     ) -> list[str]:
         """24h ticker stats → top USDT perpetuals by quote volume."""
-        c = await self.client()
+        c = await self.read_client()
         tickers = await c.futures_ticker()
         usdt = []
         for t in tickers:
@@ -199,7 +228,7 @@ class _BinanceAdapter:
             }
         """
         try:
-            c = await self.client()
+            c = await self.read_client()
             rows = await c.futures_funding_rate(symbol=symbol, limit=1)
             if not rows:
                 return None
@@ -228,7 +257,7 @@ class _BinanceAdapter:
             }
         """
         try:
-            c = await self.client()
+            c = await self.read_client()
             oi = await c.futures_open_interest(symbol=symbol)
             base = float(oi.get("openInterest", 0) or 0)
             mark = await c.futures_mark_price(symbol=symbol)
