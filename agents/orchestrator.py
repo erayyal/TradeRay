@@ -489,6 +489,14 @@ def _classify_audit(
     if action == "WAIT" or reason == "decision_wait":
         return category, mode_enum, AuditOutcome.WAITED, just[:240] or "no setup"
 
+    if "duplicate_open_signal" in reason:
+        return (
+            category,
+            mode_enum,
+            AuditOutcome.WAITED,
+            f"duplicate open signal_id={result.get('existing_signal_id')}",
+        )
+
     if "signal_only" in reason:
         return category, mode_enum, AuditOutcome.SIGNAL_SENT, just[:240] or "signal logged"
 

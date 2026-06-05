@@ -4,7 +4,7 @@ Default backend is SQLite via aiosqlite. Swap to PostgreSQL by setting
 DATABASE_URL=postgresql+asyncpg://user:pass@host/db in .env — no code changes.
 
 Schema:
-  - signals       : every multi-market AI alert (LONG/SHORT/WAIT) is logged here
+  - signals       : actionable multi-market alerts (LONG/SHORT) are logged here
   - trades        : Crypto-only — only persisted when an order actually hits Binance
   - market_config : per-market runtime config (active flag, term, execution mode)
 """

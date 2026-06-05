@@ -14,17 +14,17 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-# Provide dummy env vars so `config.settings` validates in test contexts.
-# Production env files override these; tests only need the keys to exist.
-_DEFAULTS = {
+# Force dummy env vars so tests never hit live APIs or the production DB when
+# they run inside the deployed container.
+_TEST_ENV = {
     "ANTHROPIC_API_KEY": "test-key",
     "BINANCE_API_KEY": "test",
     "BINANCE_API_SECRET": "test",
     "TELEGRAM_BOT_TOKEN": "",
     "TELEGRAM_CHAT_ID": "",
     "FRED_API_KEY": "",
-    "DATABASE_URL": "sqlite+aiosqlite:///:memory:",
+    "DATABASE_URL": "sqlite+aiosqlite:////tmp/traderay-pytest.db",
     "REDIS_URL": "redis://localhost:6379/15",
 }
-for k, v in _DEFAULTS.items():
-    os.environ.setdefault(k, v)
+for k, v in _TEST_ENV.items():
+    os.environ[k] = v

@@ -10,12 +10,15 @@ Routing matrix:
     engine downgrades it to SIGNAL_ONLY in code. This is a programmatic safety
     rail — TradeRay does not route equity orders through any broker API.
 
-Every decision (LONG / SHORT / WAIT) creates a `Signal` row regardless of
-mode. `Trade` rows are written only when an order actually hits Binance.
+Actionable decisions create `Signal` rows; WAITs live in `decision_audits`.
+`Trade` rows are written only when an order actually hits Binance.
 """
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import Any
+
+from sqlalchemy import select
 
 from core.logger import get_logger
 from core.telegram_notifier import fire, notify_signal_logged
@@ -42,6 +45,12 @@ log = get_logger(__name__)
 # ---------------------------------------------------------------------------
 
 _AUTO_BOT_ALLOWED: frozenset[MarketType] = frozenset({MarketType.CRYPTO})
+
+_DUPLICATE_SIGNAL_WINDOW: dict[Term, timedelta] = {
+    Term.SCALP: timedelta(hours=6),
+    Term.SHORT_TERM: timedelta(days=3),
+    Term.MID_TERM: timedelta(days=14),
+}
 
 
 def _assert_auto_allowed(market: MarketType) -> None:
@@ -144,6 +153,33 @@ class ExecutionEngine:
                 "reason": "decision_wait",
             }
 
+        # 2b. Do not spam the same open setup every scheduler tick. A fresh
+        # signal is allowed once the prior one resolves or the term-specific
+        # suppression window expires.
+        duplicate_signal_id = await self._find_recent_open_signal(
+            market=market,
+            term=term,
+            symbol=symbol,
+            action=action,
+        )
+        if duplicate_signal_id is not None:
+            log.info(
+                "engine.signal_duplicate_suppressed",
+                existing_signal_id=duplicate_signal_id,
+                symbol=symbol,
+                market=market.value,
+                term=term.value,
+                action=action,
+            )
+            return {
+                "signal_id": None,
+                "existing_signal_id": duplicate_signal_id,
+                "trade_id": None,
+                "executed": False,
+                "effective_mode": effective_mode,
+                "reason": "duplicate_open_signal",
+            }
+
         # 3. Persist the actionable signal — UI / backtest / audit depend on it.
         signal_id = await self._persist_signal(
             market=market,
@@ -230,6 +266,41 @@ class ExecutionEngine:
     # -----------------------------------------------------------------------
     # Persistence
     # -----------------------------------------------------------------------
+
+    async def _find_recent_open_signal(
+        self,
+        *,
+        market: MarketType,
+        term: Term,
+        symbol: str,
+        action: str,
+    ) -> int | None:
+        try:
+            action_enum = SignalAction(action)
+        except ValueError:
+            return None
+
+        cutoff = datetime.now(timezone.utc) - _DUPLICATE_SIGNAL_WINDOW[term]
+        async with AsyncSessionLocal() as session:
+            rows = (
+                await session.execute(
+                    select(Signal)
+                    .where(
+                        Signal.market == market,
+                        Signal.term == term,
+                        Signal.symbol == symbol,
+                        Signal.action == action_enum,
+                        Signal.created_at >= cutoff,
+                    )
+                    .order_by(Signal.created_at.desc())
+                    .limit(25)
+                )
+            ).scalars().all()
+
+        for row in rows:
+            if not (row.raw_payload or {}).get("resolution"):
+                return row.id
+        return None
 
     async def _persist_signal(
         self,
