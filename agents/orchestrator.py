@@ -1035,10 +1035,11 @@ async def run_market_cycle(market_config: MarketConfig) -> None:
                 macro_context=macro_context,
             )
             if result:
-                n_signaled += 1
+                if result.get("signal_id") is not None:
+                    n_signaled += 1
                 if result.get("executed"):
                     n_executed += 1
-                if result.get("reason") == "ai_canceled_pending":
+                if result.get("reason") in {"ai_canceled_pending", "rule_thesis_broken"}:
                     n_canceled += 1
         except Exception as e:
             log.exception("orchestrator.symbol_failed", symbol=sym, err=str(e))

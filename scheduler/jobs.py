@@ -84,12 +84,10 @@ TRACKER_INTERVAL_SECONDS: int = 5 * 60
 # and SHORT_TERM (4h candle) trades; it'd be wasted bandwidth at 5 min.
 CHANDELIER_INTERVAL_SECONDS: int = 30 * 60
 
-# Macro snapshot refresh — independent of use_ai. The rule engine's VIX gate
-# (Whaley 2000/2009) reads `macro:fred` from Redis; without this background
-# refresh, rule-only mode would never see a VIX value and the gate would
-# silently no-op. 15 min cadence is plenty — FRED publishes daily and we
-# cache for 1h anyway.
-MACRO_REFRESH_INTERVAL_SECONDS: int = 15 * 60
+# Macro snapshot refresh — independent of use_ai. FRED series are daily and
+# rate-limited; hourly refresh keeps the VIX/DXY/curve gates warm without
+# hammering the API.
+MACRO_REFRESH_INTERVAL_SECONDS: int = 60 * 60
 
 # LLM cost budget check — every 30 min. Fires a Telegram alert at most once
 # per UTC day when the running spend crosses `settings.llm_daily_budget_usd`.

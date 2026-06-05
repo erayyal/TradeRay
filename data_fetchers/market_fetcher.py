@@ -6,8 +6,8 @@ Adapts two backends behind one interface:
     asyncio.to_thread because yfinance is sync.
 
 Term → interval mapping:
-  Scalp       → 5m, 15m
-  Short-Term  → 1h, 4h        (yfinance: resampled from 1h)
+  Scalp       → 5m, 15m, 1h
+  Short-Term  → 1h, 4h, 1d    (yfinance: 4h resampled from 1h)
   Mid-Term    → 1d
 
 Output contract: list[dict] of OHLCV candles with keys
@@ -41,8 +41,11 @@ log = get_logger(__name__)
 # ---------------------------------------------------------------------------
 
 TERM_INTERVALS: dict[Term, list[str]] = {
-    Term.SCALP: ["5m", "15m"],
-    Term.SHORT_TERM: ["1h", "4h"],
+    # Include the rule engine's confirmation timeframe in every bundle.
+    # Without these, otherwise-valid setups are forced to WAIT by
+    # `_confirm_direction(..., confirm_interval=...)`.
+    Term.SCALP: ["5m", "15m", "1h"],
+    Term.SHORT_TERM: ["1h", "4h", "1d"],
     Term.MID_TERM: ["1d"],
 }
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 import aiohttp
 
 from config import settings
@@ -18,6 +20,14 @@ SERIES = {
     "VIXCLS": "vix",                # CBOE Volatility Index
     "DTWEXBGS": "dxy",              # Trade-weighted USD index
 }
+
+
+_API_KEY_RE = re.compile(r"(api_key=)[^&'\"]+")
+
+
+def _sanitize_error(exc: Exception) -> str:
+    """Avoid leaking FRED API keys through aiohttp's URL-rich errors."""
+    return _API_KEY_RE.sub(r"\1<redacted>", str(exc))
 
 
 async def _fetch_series(session: aiohttp.ClientSession, series_id: str) -> float | None:
@@ -46,15 +56,23 @@ async def fetch_fred() -> dict:
         log.warning("fred.skip", reason="no_api_key")
         return {"available": False}
 
+    try:
+        previous = await cache.get_json("macro:fred") or {}
+    except Exception:
+        previous = {}
+
     out: dict = {"available": True}
     async with aiohttp.ClientSession() as session:
         for series_id, name in SERIES.items():
             try:
                 out[name] = await _fetch_series(session, series_id)
             except Exception as e:
-                log.warning("fred.series_failed", series=series_id, err=str(e))
-                out[name] = None
+                log.warning("fred.series_failed", series=series_id, err=_sanitize_error(e))
+                # Keep the last known value warm when FRED rate-limits or flakes.
+                # Macro gates prefer slightly-stale data over silently losing VIX.
+                out[name] = previous.get(name)
 
-    await cache.set_json("macro:fred", out, ttl=3600)
+    out["available"] = any(out.get(name) is not None for name in SERIES.values())
+    await cache.set_json("macro:fred", out, ttl=2 * 3600)
     log.info("fred.refresh", **{k: v for k, v in out.items() if k != "available"})
     return out
