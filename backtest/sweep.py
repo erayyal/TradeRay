@@ -122,7 +122,7 @@ async def run_sweep(
     start: datetime | None,
     end: datetime | None,
     biases: Sequence[str],
-    n_bars: int = 3000,
+    n_bars: int = 1500,   # Binance futures klines hard cap per request
 ) -> list[ComboResult]:
     base = params_for(market, term)
     combos = _build_combos(base, biases)
@@ -215,7 +215,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("start", help="YYYY-MM-DD")
     p.add_argument("end", help="YYYY-MM-DD")
     p.add_argument("--biases", default="TF,MR", help="comma list of TF,MR,HYB")
-    p.add_argument("--n-bars", type=int, default=3000)
+    p.add_argument("--n-bars", type=int, default=1500)
     p.add_argument("--top", type=int, default=10)
     p.add_argument("--json", default=None, help="write full ranked results here")
     return p

@@ -137,6 +137,28 @@ _STRINGS: dict[str, dict[str, str]] = {
     "resolved_pnl":        {"tr": "kesinleşen", "en": "resolved"},
     "floating_mtm":        {"tr": "mtm",      "en": "MTM"},
     # --- Tabs ---
+    "tab_perf":            {"tr": "📈 Performans",       "en": "📈 Performance"},
+    "tab_perf_title":      {"tr": "### 📈 Sinyal Performansı — ne oldu, ne bitti (son 30 gün)",
+                            "en": "### 📈 Signal Performance — what happened (last 30 days)"},
+    "perf_open_title":     {"tr": "#### ⏳ Açık sinyaller — sonuç bekleniyor",
+                            "en": "#### ⏳ Open signals — awaiting resolution"},
+    "perf_closed_title":   {"tr": "#### ✅ Sonuçlanan sinyaller",
+                            "en": "#### ✅ Resolved signals"},
+    "perf_breakdown":      {"tr": "#### 🧮 Piyasa / vade kırılımı",
+                            "en": "#### 🧮 Market / term breakdown"},
+    "perf_no_signals":     {"tr": "Henüz LONG/SHORT sinyal yok. Sistem setup bulunca burada görünecek.",
+                            "en": "No LONG/SHORT signals yet. They will appear here once the engine finds a setup."},
+    "perf_no_open":        {"tr": "Şu an açık sinyal yok.", "en": "No open signals right now."},
+    "perf_no_closed":      {"tr": "Henüz TP/SL'ye ulaşan sinyal yok — pozisyonlar hâlâ açık.",
+                            "en": "No signal has hit TP/SL yet — positions still open."},
+    "perf_help":           {"tr": "Bu sayfa SİNYAL bazlıdır: sen işlem açmasan da sistem her sinyali "
+                                  "kendi planıyla (giriş/TP/SL) takip eder ve fiyat TP ya da SL'ye "
+                                  "değdiğinde sonucu buraya yazar. 'Anlık K/Z' henüz kapanmamış "
+                                  "sinyalin şu anki fiyata göre teorik kâr/zararıdır.",
+                            "en": "This page is SIGNAL-based: even if you don't trade, the system tracks "
+                                  "every signal against its own plan (entry/TP/SL) and records the outcome "
+                                  "when price touches TP or SL. 'Floating PnL' is the theoretical PnL of a "
+                                  "still-open signal at the current price."},
     "tab_signals":         {"tr": "📡 Sinyaller",        "en": "📡 Signals"},
     "tab_trades":          {"tr": "🪙 Trade'ler",         "en": "🪙 Trades"},
     "tab_decisions":       {"tr": "🧠 Son Kararlar",      "en": "🧠 Latest Decisions"},
@@ -903,6 +925,152 @@ def render_pnl_matrix(
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 
+def render_performance_tab(
+    signals: list[dict], prices: dict[str, float | None],
+) -> None:
+    """Plain-language signal scoreboard: open positions, resolved outcomes,
+    and a market×term breakdown. Built for monitoring without trading."""
+    st.markdown(t("tab_perf_title"))
+    st.caption(t("perf_help"))
+
+    actionable = [
+        s for s in signals
+        if s["action"] in ("LONG", "SHORT")
+        and s["entry"] is not None and s["tp"] is not None and s["sl"] is not None
+    ]
+    if not actionable:
+        st.info(t("perf_no_signals"))
+        return
+
+    now = datetime.now(timezone.utc)
+    open_rows, closed_rows = [], []
+    total_resolved_pnl = 0.0
+    total_mtm = 0.0
+    wins = losses = 0
+
+    for s in actionable:
+        entry, tp, sl = s["entry"], s["tp"], s["sl"]
+        risk = s["risk_usd"] or 0.0
+        risk_per_unit = abs(entry - sl)
+        size = (risk / risk_per_unit) if risk_per_unit > 0 else 0.0
+        is_long = s["action"] == "LONG"
+        res = _signal_resolution(s)
+
+        if res:
+            pnl = res.get("theoretical_pnl_usd") or 0.0
+            total_resolved_pnl += pnl
+            outcome = res.get("outcome")
+            if outcome == "TP":
+                wins += 1
+            else:
+                losses += 1
+            resolved_at = res.get("resolved_at")
+            try:
+                dur_h = (
+                    datetime.fromisoformat(str(resolved_at)) - s["created_at"]
+                ).total_seconds() / 3600.0
+            except (TypeError, ValueError):
+                dur_h = None
+            r_mult = (pnl / risk) if risk > 0 else None
+            closed_rows.append({
+                "Tarih": s["created_at"].strftime("%m-%d %H:%M"),
+                "Piyasa": s["market"],
+                "Sembol": s["symbol"],
+                "Yön": "⬆ LONG" if is_long else "⬇ SHORT",
+                "Sonuç": "✅ TP (kâr)" if outcome == "TP" else "🛑 SL (zarar)",
+                "Giriş": round(entry, 4),
+                "Çıkış": round(res.get("exit_price") or 0, 4),
+                "K/Z (USD)": round(pnl, 2),
+                "R": round(r_mult, 2) if r_mult is not None else None,
+                "Süre (saat)": round(dur_h, 1) if dur_h is not None else None,
+            })
+        else:
+            current = prices.get(s["symbol"])
+            mtm = None
+            if current is not None and size > 0:
+                mtm = (current - entry) * size if is_long else (entry - current) * size
+                total_mtm += mtm
+            tp_dist = abs(tp - (current or entry)) / (current or entry) * 100
+            sl_dist = abs((current or entry) - sl) / (current or entry) * 100
+            age_h = (now - s["created_at"]).total_seconds() / 3600.0
+            open_rows.append({
+                "Tarih": s["created_at"].strftime("%m-%d %H:%M"),
+                "Piyasa": s["market"],
+                "Sembol": s["symbol"],
+                "Yön": "⬆ LONG" if is_long else "⬇ SHORT",
+                "Giriş": round(entry, 4),
+                "Şu an": round(current, 4) if current is not None else None,
+                "Anlık K/Z (USD)": round(mtm, 2) if mtm is not None else None,
+                "TP'ye uzaklık %": round(tp_dist, 2),
+                "SL'ye uzaklık %": round(sl_dist, 2),
+                "Yaş (saat)": round(age_h, 1),
+            })
+
+    # Headline scoreboard
+    n_resolved = wins + losses
+    win_rate = (wins / n_resolved) if n_resolved else 0.0
+    k = st.columns(6)
+    k[0].metric("Toplam sinyal" if _lang() == "tr" else "Total signals", len(actionable))
+    k[1].metric("Açık" if _lang() == "tr" else "Open", len(open_rows))
+    k[2].metric("✅ TP", wins)
+    k[3].metric("🛑 SL", losses)
+    k[4].metric(
+        "Kazanma oranı" if _lang() == "tr" else "Win rate",
+        f"{win_rate:.0%}" if n_resolved else "—",
+    )
+    k[5].metric(
+        "Toplam K/Z (USD)" if _lang() == "tr" else "Total PnL (USD)",
+        f"${total_resolved_pnl + total_mtm:,.2f}",
+        delta=(
+            f"kapanan ${total_resolved_pnl:,.2f} + açık ${total_mtm:,.2f}"
+            if _lang() == "tr"
+            else f"closed ${total_resolved_pnl:,.2f} + floating ${total_mtm:,.2f}"
+        ),
+        delta_color="off",
+    )
+
+    st.markdown(t("perf_open_title"))
+    if open_rows:
+        st.dataframe(pd.DataFrame(open_rows), use_container_width=True, hide_index=True)
+    else:
+        st.info(t("perf_no_open"))
+
+    st.markdown(t("perf_closed_title"))
+    if closed_rows:
+        st.dataframe(pd.DataFrame(closed_rows), use_container_width=True, hide_index=True)
+    else:
+        st.info(t("perf_no_closed"))
+
+    # Market × term breakdown
+    st.markdown(t("perf_breakdown"))
+    groups: dict[tuple[str, str], dict[str, Any]] = {}
+    for s in actionable:
+        key = (s["market"], s["term"])
+        g = groups.setdefault(key, {"n": 0, "tp": 0, "sl": 0, "pnl": 0.0})
+        g["n"] += 1
+        res = _signal_resolution(s)
+        if res:
+            g["pnl"] += res.get("theoretical_pnl_usd") or 0.0
+            if res.get("outcome") == "TP":
+                g["tp"] += 1
+            else:
+                g["sl"] += 1
+    rows = []
+    for (mkt, term), g in sorted(groups.items()):
+        n_res = g["tp"] + g["sl"]
+        rows.append({
+            "Piyasa": mkt,
+            "Vade": term,
+            "Sinyal": g["n"],
+            "Açık": g["n"] - n_res,
+            "✅ TP": g["tp"],
+            "🛑 SL": g["sl"],
+            "Kazanma %": f"{g['tp'] / n_res:.0%}" if n_res else "—",
+            "Kapanan K/Z (USD)": round(g["pnl"], 2),
+        })
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+
 def render_signals_tab(signals: list[dict]) -> None:
     st.markdown(t("tab_signals_title"))
     fcols = st.columns([1, 1, 1, 2])
@@ -1582,11 +1750,14 @@ def main() -> None:
     render_pnl_matrix(trades, signals, redis_state["prices"])
 
     st.divider()
-    t1, t2, t3, t4, t5 = st.tabs([
+    t0, t1, t2, t3, t4, t5 = st.tabs([
+        t("tab_perf"),
         t("tab_signals"), t("tab_trades"),
         t("tab_decisions"), t("tab_costs"),
         t("tab_audit"),
     ])
+    with t0:
+        render_performance_tab(signals, redis_state["prices"])
     with t1:
         render_signals_tab(signals)
     with t2:
