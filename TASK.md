@@ -6,9 +6,28 @@
 
 ---
 
-## 1. Durum (2026-05-16)
+## 1. Durum (2026-06-11 güncellemesi)
 
-**Sürüm**: v2.6 — Phase 3.5 tamamlandı (commit `d6c3748`).
+**Sürüm**: v2.8 — portfolio risk overlay + AI verifier disiplini + sweep harness.
+
+v2.8 ile eklenenler (detay: `ALGORITHM.md` §8C):
+- `execution/portfolio_guard.py` — günlük zarar kill-switch (%3), SL cooldown,
+  market başına 3 / toplam 8 açık exposure limiti.
+- AI layer artık `rule_proposal`'ı görür + kod-seviyesi guardrails
+  (confidence floor 65, direction-flip yasak, risk clamp).
+- Model routing: quant/sentiment → Haiku 4.5, master → Opus 4.8;
+  sentiment 30dk Redis cache; LLM fiyat tablosu düzeltildi.
+- `backtest/sweep.py` — Phase 4-a/4-b parametre sweep (DSR, n_trials=grid).
+- Walk-forward fix: eski SHORT_TERM "0 setup" bulgusu harness bug'ıydı
+  (confirm_interval override geçirilmiyordu) — eski sonuçlar geçersiz.
+
+**Canlı gözlem (2026-06-05 → 06-11, DB reseed sonrası):** 12 sinyal
+(tümü SHORT_TERM LONG: 5 SP500, 4 NASDAQ, 2 BIST, 1 CRYPTO), 0 resolved
+(TP/SL'ye henüz dokunulmadı — 4h HYB hedefleri günler sürer). LLM cost $0
+(use_ai tüm marketlerde kapalı). Örneklem küçük; parametre kararı sweep'le
+verilecek.
+
+**Eski durum (2026-05-16)**: v2.6 — Phase 3.5 tamamlandı (commit `d6c3748`).
 
 - Sunucu: `developer@135.181.93.25:/opt/traderay`
 - 5 container healthy: `traderay-backend / ui / postgres / redis / cloudflared`

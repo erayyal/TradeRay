@@ -158,6 +158,8 @@ async def run_walk_forward(
     end: datetime | None = None,
     n_bars: int = 1500,
     n_trials: int = 1,
+    params: TermParams | None = None,
+    candles: list[dict] | None = None,
 ) -> BacktestResult:
     """Replay history bar-by-bar and produce a `BacktestResult`.
 
@@ -168,12 +170,19 @@ async def run_walk_forward(
       - One trade at a time per symbol — if an entry is open, additional
         signals are ignored until that trade closes. Matches the live
         execution invariant: one active position per symbol.
+      - `params` overrides the production parameter table (sweep harness);
+        confirm_interval is cleared either way (single-TF replay).
+      - `candles` lets the caller pass pre-fetched history so a sweep over
+        hundreds of parameter combos fetches each symbol's candles once.
     """
-    p_full = params_for(market, term)
-    p = _params_for_backtest(market, term)
+    if params is not None:
+        p = dataclasses.replace(params, confirm_interval=None)
+    else:
+        p = _params_for_backtest(market, term)
     interval = p.signal_interval
 
-    candles = await _fetch_history(symbol, market, interval, n_bars=n_bars)
+    if candles is None:
+        candles = await _fetch_history(symbol, market, interval, n_bars=n_bars)
     candles = _filter_window(candles, start, end)
     if not candles:
         log.warning(
@@ -213,6 +222,7 @@ async def run_walk_forward(
             indicators={interval: indicators},
             macro_lite=None,
             next_earnings_iso=None,
+            params_override=p,
         )
 
         if decision["decision"] in ("LONG", "SHORT"):

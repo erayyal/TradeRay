@@ -146,6 +146,21 @@ _retry_decorator = tenacity.retry(
 # The one entrypoint agents use
 # ---------------------------------------------------------------------------
 
+# Models that support `thinking: {"type": "adaptive"}`. Haiku 4.5 does NOT —
+# sending the param there 400s, so we omit thinking entirely for it.
+_ADAPTIVE_THINKING_PREFIXES: tuple[str, ...] = (
+    "claude-opus-4-6",
+    "claude-opus-4-7",
+    "claude-opus-4-8",
+    "claude-sonnet-4-6",
+    "claude-fable",
+)
+
+
+def _supports_adaptive_thinking(model: str) -> bool:
+    return model.startswith(_ADAPTIVE_THINKING_PREFIXES)
+
+
 @_retry_decorator
 async def call_agent(
     *,
@@ -154,6 +169,7 @@ async def call_agent(
     max_tokens: int = 2500,
     cache_system: bool = True,
     label: str = "agent",
+    model: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Call Anthropic's Messages API and return BOTH the parsed JSON
     decision AND a usage dict (for cost tracking).
@@ -167,6 +183,8 @@ async def call_agent(
         max_tokens: Cap on output tokens.
         cache_system: If True, system block carries cache_control=ephemeral.
         label: Free-text tag for logging / observability (e.g. "quant:BTCUSDT").
+        model: Override model id for this call (per-agent routing). Falls
+            back to settings.anthropic_model when None.
 
     Returns:
         A tuple `(parsed_json, usage_dict)` where `usage_dict` contains:
@@ -198,13 +216,18 @@ async def call_agent(
     else:
         message_content = user_content
 
-    response = await client.messages.create(
-        model=settings.anthropic_model,
-        max_tokens=max_tokens,
-        system=system_blocks,
-        thinking={"type": "adaptive"},  # Opus 4.7 — model picks depth
-        messages=[{"role": "user", "content": message_content}],
-    )
+    model_id = model or settings.anthropic_model
+
+    request_kwargs: dict[str, Any] = {
+        "model": model_id,
+        "max_tokens": max_tokens,
+        "system": system_blocks,
+        "messages": [{"role": "user", "content": message_content}],
+    }
+    if _supports_adaptive_thinking(model_id):
+        request_kwargs["thinking"] = {"type": "adaptive"}
+
+    response = await client.messages.create(**request_kwargs)
 
     # Concatenate all visible text blocks (we ignore Anthropic's internal
     # `thinking` blocks — the model's own <thinking> in plain text is what
@@ -224,7 +247,7 @@ async def call_agent(
         "cache_creation_input_tokens": int(
             getattr(usage, "cache_creation_input_tokens", 0) or 0
         ),
-        "model": settings.anthropic_model,
+        "model": model_id,
         "stop_reason": response.stop_reason,
     }
 

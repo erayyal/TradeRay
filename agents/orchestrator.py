@@ -139,12 +139,14 @@ async def _read_screener_flag(market: MarketType) -> bool:
 # ---------------------------------------------------------------------------
 
 LLM_PRICING: dict[str, dict[str, float]] = {
-    "claude-opus-4-7":   {"input": 15.0, "output": 75.0},
+    "claude-opus-4-8":   {"input":  5.0, "output": 25.0},
+    "claude-opus-4-7":   {"input":  5.0, "output": 25.0},
     "claude-opus-4-6":   {"input":  5.0, "output": 25.0},
     "claude-sonnet-4-6": {"input":  3.0, "output": 15.0},
     "claude-haiku-4-5":  {"input":  1.0, "output":  5.0},
 }
-_DEFAULT_PRICING: dict[str, float] = LLM_PRICING["claude-opus-4-7"]
+# Conservative fallback for unknown model ids — highest tier we route to.
+_DEFAULT_PRICING: dict[str, float] = LLM_PRICING["claude-opus-4-8"]
 
 
 def _compute_llm_cost_usd(
@@ -263,11 +265,15 @@ async def _run_quant(
         user_content=json.dumps(payload, default=str),
         max_tokens=2500,
         label=f"quant:{symbol}",
+        model=settings.anthropic_model_quant,
     )
     await _log_llm_cost(
         market=market, symbol=symbol, agent_label="quant", usage=usage,
     )
     return parsed
+
+
+_SENTIMENT_CACHE_KEY = "sentiment:latest_report"
 
 
 async def _run_sentiment(
@@ -276,18 +282,40 @@ async def _run_sentiment(
     market: MarketType,
     symbol: str,
 ) -> dict[str, Any] | None:
-    """Sentiment Scanner — attributed to the symbol that triggered the call so
-    LLM cost reports break down correctly per market/symbol (the scanner reads
-    global macro data but we still pay per-symbol invocation costs)."""
+    """Sentiment Scanner with a Redis result cache.
+
+    The scanner's input is GLOBAL macro context (news/FRED/DefiLlama) — it
+    does not vary per symbol. Pre-cache, every setup in a cycle paid for its
+    own identical Sentiment call; now the first setup pays and the rest read
+    the cached report for `sentiment_cache_seconds` (default 30 min, matching
+    the macro refresh cadence). Cost attribution stays on the symbol that
+    actually triggered the LLM call.
+    """
+    try:
+        cached = await cache.get_json(_SENTIMENT_CACHE_KEY)
+        if cached:
+            log.debug("orchestrator.sentiment_cache_hit", symbol=symbol)
+            return cached
+    except Exception as e:
+        log.warning("orchestrator.sentiment_cache_read_failed", err=str(e))
+
     parsed, usage = await call_agent(
         system_prompt=SENTIMENT_SYSTEM_PROMPT,
         user_content=json.dumps(macro_context, default=str),
         max_tokens=3500,
         label=f"sentiment:{symbol}",
+        model=settings.anthropic_model_sentiment,
     )
     await _log_llm_cost(
         market=market, symbol=symbol, agent_label="sentiment", usage=usage,
     )
+    if parsed:
+        try:
+            await cache.set_json(
+                _SENTIMENT_CACHE_KEY, parsed, ttl=settings.sentiment_cache_seconds,
+            )
+        except Exception as e:
+            log.warning("orchestrator.sentiment_cache_write_failed", err=str(e))
     return parsed
 
 
@@ -358,6 +386,7 @@ async def _run_master_trader(
     execution_mode: ExecutionMode,
     pending_order: dict[str, Any] | None,
     microstructure: dict[str, Any],
+    rule_decision: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Compose the multi-modal payload (image + JSON, with optional pending
     order context + market-specific microstructure data) and call the brain.
@@ -376,6 +405,10 @@ async def _run_master_trader(
         "sentiment": sentiment,
         "microstructure": microstructure,  # funding/OI for crypto, USDTRY for BIST
         "pending_order": pending_order,    # null when no order resting
+        # The deterministic rule engine's proposed plan — the thing the AI
+        # layer exists to VERIFY. Without it the Master Trader was re-deriving
+        # a plan from scratch instead of auditing the proposal.
+        "rule_proposal": rule_decision,
         "risk_envelope": {
             "portfolio_notional_usd": settings.portfolio_notional,
             "max_risk_pct": settings.max_risk_pct,
@@ -396,6 +429,7 @@ async def _run_master_trader(
         user_content=user_content,
         max_tokens=3000,
         label=f"master:{symbol}",
+        model=settings.anthropic_model_master,
     )
     await _log_llm_cost(
         market=market, symbol=symbol, agent_label="master", usage=usage,
@@ -407,6 +441,80 @@ async def _run_master_trader(
 # conviction is high enough that vision-confirmation is worth ~3K extra
 # input tokens. Sub-threshold setups get text-only Master Trader calls.
 _VISION_CONFIDENCE_THRESHOLD: int = 70
+
+
+def apply_ai_guardrails(
+    rule_decision: dict[str, Any],
+    master_decision: dict[str, Any],
+    *,
+    min_confidence: int | None = None,
+) -> dict[str, Any]:
+    """Deterministic post-processing of the Master Trader's verdict.
+
+    The AI layer is a VERIFIER over the rule engine's proposal, not an
+    independent signal source. Three code-enforced rules (the prompt asks
+    for the same, but we do not trust LLM output for money):
+
+      1. CONFIDENCE FLOOR — a LONG/SHORT with confidence below
+         `ai_min_confidence` becomes WAIT. Low-conviction overrides are the
+         "manufacture a trade to look productive" failure mode.
+      2. NO DIRECTION FLIPS — if the AI returns the OPPOSITE direction from
+         the rule proposal, the result is WAIT, not the AI's trade.
+         Disagreement between two models is evidence of no edge, not a
+         counter-trade signal (ensemble-disagreement veto).
+      3. RISK CLAMP — the AI may resize DOWN but never UP: risk_usd is
+         capped at the rule plan's risk_usd; sizing fields scale with it.
+
+    CANCEL_PENDING and WAIT pass through untouched. Mutates and returns
+    `master_decision`.
+    """
+    floor = settings.ai_min_confidence if min_confidence is None else min_confidence
+    action = master_decision.get("decision")
+    if action not in ("LONG", "SHORT"):
+        return master_decision
+
+    rule_action = rule_decision.get("decision")
+    conf = int(master_decision.get("confidence_level") or master_decision.get("confidence") or 0)
+
+    def _to_wait(reason: str) -> dict[str, Any]:
+        just = (master_decision.get("justification") or "")[:400]
+        master_decision.update({
+            "decision": "WAIT",
+            "entry_price": None, "entry": None,
+            "take_profit": None, "stop_loss": None,
+            "position_size_base": None, "position_notional_usd": None,
+            "risk_usd": None, "reward_risk_ratio": None,
+            "leverage": 1,
+            "justification": f"[guardrail:{reason}] {just}",
+        })
+        master_decision.setdefault("conflict_flags", []).append(f"guardrail_{reason}")
+        log.info(
+            "orchestrator.ai_guardrail_wait",
+            reason=reason, ai_action=action, rule_action=rule_action, confidence=conf,
+        )
+        return master_decision
+
+    if conf < floor:
+        return _to_wait(f"confidence_{conf}_below_{floor}")
+
+    if rule_action in ("LONG", "SHORT") and action != rule_action:
+        return _to_wait("direction_flip_vs_rule")
+
+    rule_risk = rule_decision.get("risk_usd")
+    ai_risk = master_decision.get("risk_usd")
+    if rule_risk and ai_risk and ai_risk > rule_risk * 1.001:
+        scale = rule_risk / ai_risk
+        for k in ("risk_usd", "position_size_base", "position_notional_usd"):
+            v = master_decision.get(k)
+            if v is not None:
+                master_decision[k] = v * scale
+        master_decision.setdefault("conflict_flags", []).append("guardrail_risk_clamped")
+        log.info(
+            "orchestrator.ai_guardrail_risk_clamp",
+            ai_risk=round(ai_risk, 2), rule_risk=round(rule_risk, 2),
+        )
+
+    return master_decision
 
 
 # ---------------------------------------------------------------------------
@@ -777,6 +885,7 @@ async def run_symbol_cycle(
                     execution_mode=execution_mode,
                     pending_order=pending_order,
                     microstructure=microstructure,
+                    rule_decision=rule_decision,
                 ),
             )
 
@@ -799,6 +908,7 @@ async def run_symbol_cycle(
                 )
                 final_decision = rule_decision
             else:
+                master_decision = apply_ai_guardrails(rule_decision, master_decision)
                 final_decision = _normalize_decision(master_decision)
 
     # 5. Tag and persist the final decision for the UI

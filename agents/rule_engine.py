@@ -675,6 +675,9 @@ def generate_rule_decision(
     # Macro/microstructure context (None ⇒ gates skipped — backwards compat).
     macro_lite: dict[str, Any] | None = None,
     next_earnings_iso: str | None = None,
+    # Parameter override — used by the backtest sweep harness to evaluate
+    # candidate TermParams without mutating the production table.
+    params_override: TermParams | None = None,
 ) -> dict[str, Any]:
     """Dispatch to the (market × term) policy and run its bias-specific evaluator.
 
@@ -683,7 +686,7 @@ def generate_rule_decision(
     gate (size halver) flows through and scales position size at construction.
     """
     try:
-        p = params_for(market, term)
+        p = params_override if params_override is not None else params_for(market, term)
     except KeyError:
         log.warning("rule_engine.no_params", market=market.value, term=term.value)
         return _empty_wait(

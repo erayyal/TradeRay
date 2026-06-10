@@ -23,6 +23,7 @@ from sqlalchemy import select
 from core.logger import get_logger
 from core.telegram_notifier import fire, notify_signal_logged
 from execution.binance_executor import place_decision
+from execution.portfolio_guard import check_portfolio_gates
 from execution.risk_manager import RiskRejection, validate_decision
 from models import (
     AsyncSessionLocal,
@@ -178,6 +179,22 @@ class ExecutionEngine:
                 "executed": False,
                 "effective_mode": effective_mode,
                 "reason": "duplicate_open_signal",
+            }
+
+        # 2c. Portfolio-level risk gates — daily loss kill-switch, SL cooldown,
+        # concurrency/heat caps. Applies to BOTH signal-only and auto-bot paths
+        # (a signal stream polluted by revenge re-entries and correlated
+        # pile-ons is as misleading as the trades would be).
+        allow, guard_reason = await check_portfolio_gates(
+            market=market, term=term, symbol=symbol, direction=action,
+        )
+        if not allow:
+            return {
+                "signal_id": None,
+                "trade_id": None,
+                "executed": False,
+                "effective_mode": effective_mode,
+                "reason": f"portfolio_guard:{guard_reason}",
             }
 
         # 3. Persist the actionable signal — UI / backtest / audit depend on it.

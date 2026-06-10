@@ -1,4 +1,4 @@
-  # TradeRay — Karar Algoritması (v2.6 — Phase 3.5 production gap'leri kapandı)
+  # TradeRay — Karar Algoritması (v2.8 — portfolio risk overlay + AI verifier disiplini + sweep harness)
 
   > **Bu dosya: bot şu anda trade ve sinyali NEYE göre üretir?**
   >
@@ -346,6 +346,87 @@
   `python -m backtest <SYMBOL> CRYPTO MID_TERM 2024-01-01 2026-05-15 --n-trials 12`
 
   Detaylı sonuç: [`backtest/results/2026-05-16_smoke_test.md`](backtest/results/2026-05-16_smoke_test.md)
+
+  ---
+
+  ## 8C. v2.8 eklemeleri (2026-06-11)
+
+  ### 8C.1 Portfolio-level risk overlay — `execution/portfolio_guard.py`
+
+  Sinyal-seviyesi rule engine'in göremediği üç klasik hata moduna karşı,
+  `engine.route()` içinde signal persist edilmeden ÖNCE çalışan gate'ler
+  (Carver 2015 §9 system risk overlays; Tharp 2008 heat caps):
+
+  | Gate | Tetik | Default | Settings |
+  |---|---|---|---|
+  | **Daily loss kill-switch** | Bugünkü realized + theoretical PnL ≤ −(notional × pct) | 3% | `DAILY_LOSS_LIMIT_PCT` |
+  | **SL cooldown** | Aynı (symbol, term, yön) son SL'den sonra pencere içinde | SCALP 4h / SHORT 24h / MID 3d | `SL_COOLDOWN_ENABLED` |
+  | **Concurrency cap** | Açık exposure (unresolved sinyal + canlı trade) | 3/market, 8 toplam | `MAX_OPEN_PER_MARKET`, `MAX_OPEN_TOTAL` |
+
+  Gate'ler hem SIGNAL_ONLY hem AUTO_BOT yolunda çalışır (revenge re-entry ve
+  korele pile-on sinyal akışını da kirletir). Infrastructure hatasında
+  fail-open + loud log. Saf karar mantığı `evaluate_portfolio_gates()` —
+  DB'siz unit-test edilir (`tests/test_portfolio_guard.py`).
+
+  ### 8C.2 AI Verification Layer v2 — "verifier, not generator"
+
+  **Sorun:** Master Trader rule engine'in planını hiç GÖRMÜYORDU — sıfırdan
+  plan türetiyordu; düşük convictionla "işlem atmış olmak için" trade
+  üretebiliyordu. v2.8 değişiklikleri:
+
+  1. **`rule_proposal` payload'da** — AI artık denetlediği planı görür;
+     prompt "audit the proposal; default WAIT; reject = success" çerçevesine
+     güncellendi.
+  2. **Kod-seviyesi guardrails** (`orchestrator.apply_ai_guardrails`, prompt'a
+     güvenilmez):
+     - Confidence floor: LONG/SHORT + conf < `AI_MIN_CONFIDENCE` (65) → WAIT.
+     - Direction flip yasak: AI rule'un tersini derse → WAIT
+       (ensemble-disagreement = edge yok).
+     - Risk clamp: AI risk_usd'yi sadece DÜŞÜREBİLİR; artış rule planına
+       ölçeklenir.
+
+  ### 8C.3 Token ekonomisi — model routing + sentiment cache
+
+  | Ajan | Eski | Yeni | Maliyet |
+  |---|---|---|---|
+  | Quant | global model (sonnet) | **Haiku 4.5** (`ANTHROPIC_MODEL_QUANT`) | $1/$5 per MTok |
+  | Sentiment | global model, **sembol başına çağrı** | **Haiku 4.5** + **30dk Redis cache** (`SENTIMENT_CACHE_SECONDS`) | cycle başına ≤1 çağrı |
+  | Master | global model | **Opus 4.8** (`ANTHROPIC_MODEL_MASTER`) | $5/$25 per MTok |
+
+  - LLM_PRICING tablosu düzeltildi (Opus 4.7 $15/$75 değil $5/$25'ti — cost
+    loglar 3× şişkindi).
+  - Haiku adaptive thinking desteklemez → `llm_client` thinking parametresini
+    model-bazlı geçirir.
+
+  ### 8C.4 Parametre sweep harness — `backtest/sweep.py` (Phase 4-a/4-b)
+
+  ```
+  python -m backtest.sweep BTCUSDT,ETHUSDT,SOLUSDT CRYPTO MID_TERM \
+      2024-01-01 2026-06-01 --biases TF,MR --json results.json
+  ```
+
+  - Grid: `atr_sl_mult×rr_target×adx_min×rel_volume_min` (108) × bias; MR
+    için 3 RSI eşik çifti (toplam 432 combo).
+  - DSR `n_trials = full grid` ile hesaplanır (Bailey-LdP 2014 multiple-testing
+    cezası kazanana değil tüm denemelere uygulanır).
+  - Mum verisi sembol başına 1 kez çekilir, tüm combolarda paylaşılır.
+  - Çıktı kuralı: **DSR > 0.5 ve ≥20 trade yoksa AUTO_BOT açılmaz** (§11.5).
+
+  ### 8C.5 Walk-forward bug fix — SHORT_TERM "0 setup"un asıl nedeni
+
+  Eski harness `confirm_interval`'i temizlenmiş parametreleri hazırlıyor ama
+  `generate_rule_decision`'a GEÇİRMİYORDU; engine production parametrelerini
+  (confirm TF'li) kullanıyor, tek-TF replay'de onay verisi olmadığından tüm
+  MR/HYB sinyalleri "confirmation interval has no usable data" ile WAIT'e
+  düşüyordu. v2.6 smoke testindeki "SHORT_TERM 0 setup" bulgusunun başlıca
+  nedeni buydu → eski SHORT_TERM backtest sonuçları geçersiz, sweep ile
+  yeniden değerlendirilmeli. Fix: `params_override` parametresi.
+
+  ### 8C.6 Faber trend filtresi — zaten mevcut (kod değişikliği yok)
+
+  `_evaluate_tf` LONG için `price > EMA_slow` ister ve 1d interval'de
+  `ema_slow=200` (`INDICATOR_LOOKBACKS`) — Faber 2007'nin 10-aylık SMA
+  filtresi ile aynı işlev. Ek filtre eklemek redundant olurdu.
 
   ---
 
