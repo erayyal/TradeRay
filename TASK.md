@@ -6,7 +6,28 @@
 
 ---
 
-## 1. Durum (2026-06-11 güncellemesi — v2.9)
+## 0. Durum (2026-06-11 akşam — v3.0)
+
+v3.0 eklentileri (hepsi prod'da, 82/82 test):
+- **Exit mühendisliği**: `TermParams.breakeven_at_r` / `max_holding_bars`;
+  walk-forward simülasyonu (BE/TIME outcome'ları, SL-öncelikli konservatif),
+  tracker'da birebir canlı mirror, gerçek trade'lerde Chandelier'a BE tabanı.
+  Hangi hücrede aktif olduğu exit-grid sweep sonucuna bağlı
+  (`/tmp/exit_*.json` sunucuda; rapor backtest/results/).
+- **HMM rejim filtresi**: `data_fetchers/regime.py` (saf numpy Baum-Welch,
+  filtered olasılık — lookahead yok). `TermParams.regime_filter` gate'i;
+  orchestrator her cycle `regime_p_high`'ı indikatörlere + audit'e yazar.
+- **Fear&Greed** (alternative.me, ücretsiz): macro_lite + audit + AI bağlamı.
+  Sert kural YOK — önce veri biriksin, sonra sweep'le test edilir.
+- **BIST earnings blackout**: yfinance tabanlı, fail-open (KAP RSS upgrade yolu).
+- **Aylık drift re-sweep**: her ayın 1'i 03:10 UTC, subprocess'te 3 hücre
+  sweep'i + Telegram raporu (✅ sağlıklı / ⚠️ izle / 🚨 re-tune). Otomatik
+  uygulama YOK (`scheduler/resweep.py:SWEEP_SPECS` — parametre değişince
+  baseline_dsr güncellenmeli!).
+- **Bar-hizalı cron tetikleme**: SCALP */5dk, SHORT_TERM :01/:16/:31/:46,
+  MID_TERM saatlik :02 (UTC). WAIT-audit Redis dedup'lu.
+
+## 1. Önceki durum (2026-06-11 öğlen — v2.9)
 
 **Sürüm**: v2.9 — Phase 4 sweep parametreleri CANLIDA.
 

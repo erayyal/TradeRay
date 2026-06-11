@@ -138,6 +138,39 @@ def filtered_p_high(
     return out
 
 
+def _filter_step(
+    alpha: np.ndarray, r: float,
+    A: np.ndarray, means: np.ndarray, vars_: np.ndarray,
+) -> np.ndarray:
+    """One incremental forward-filter step on a single new return."""
+    logb = np.array([
+        _gaussian_logpdf(np.array([r]), means[0], vars_[0])[0],
+        _gaussian_logpdf(np.array([r]), means[1], vars_[1])[0],
+    ])
+    b = np.exp(logb - logb.max())
+    nxt = (alpha @ A) * b
+    s = nxt.sum() or 1e-300
+    return nxt / s
+
+
+def _forward_filter_full(
+    rets: np.ndarray,
+    pi: np.ndarray, A: np.ndarray, means: np.ndarray, vars_: np.ndarray,
+) -> np.ndarray:
+    """Full forward pass; returns the final alpha (state posterior)."""
+    logB = np.stack([
+        _gaussian_logpdf(rets, means[0], vars_[0]),
+        _gaussian_logpdf(rets, means[1], vars_[1]),
+    ], axis=1)
+    B = np.exp(logB - logB.max(axis=1, keepdims=True))
+    alpha = pi * B[0]
+    alpha /= alpha.sum() or 1e-300
+    for t in range(1, len(rets)):
+        alpha = (alpha @ A) * B[t]
+        alpha /= alpha.sum() or 1e-300
+    return alpha
+
+
 def annotate_regime(
     candles: list[dict],
     *,
@@ -146,8 +179,10 @@ def annotate_regime(
 ) -> list[float | None]:
     """Per-bar filtered P(high-vol) aligned with `candles`. None pre-warmup.
 
-    Expanding-window refits every `refit_every` bars; between refits, the
-    forward filter keeps running on frozen parameters — strictly causal.
+    Expanding-window refits every `refit_every` bars; BETWEEN refits the
+    forward filter advances incrementally on frozen parameters (one
+    O(1) step per bar instead of a full O(t) re-pass) — strictly causal
+    and ~T/refit_every× faster than the naive formulation.
     """
     closes = np.array([float(c["close"]) for c in candles], dtype=np.float64)
     if len(closes) < min_obs + 1:
@@ -156,20 +191,24 @@ def annotate_regime(
     rets = np.diff(np.log(np.maximum(closes, 1e-12)))   # rets[i] = bar i+1's return
     out: list[float | None] = [None] * len(candles)
 
-    params = None
+    params: tuple | None = None
+    alpha: np.ndarray | None = None
     next_refit = min_obs
     for t in range(min_obs, len(rets) + 1):
         if params is None or t >= next_refit:
             try:
                 params = fit_hmm(rets[:t])
+                alpha = _forward_filter_full(rets[:t], *params)
             except Exception as e:   # EM blowup on degenerate data → keep old
                 log.debug("regime.fit_failed", err=str(e), t=t)
                 if params is None:
                     return out
             next_refit = t + refit_every
-        if t >= 1:
-            p = filtered_p_high(rets[:t], *params)
-            out[t] = float(p[-1])    # candle index t ↔ return index t-1
+        elif alpha is not None:
+            _pi, A, means, vars_ = params
+            alpha = _filter_step(alpha, float(rets[t - 1]), A, means, vars_)
+        if alpha is not None:
+            out[t] = float(alpha[1])   # candle index t ↔ return index t-1
     return out
 
 

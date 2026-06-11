@@ -30,7 +30,7 @@ from typing import Any, Sequence
 
 from agents.rule_engine import TermParams, params_for
 from backtest.stats import summarize
-from backtest.walk_forward import _fetch_history, run_walk_forward
+from backtest.walk_forward import _fetch_history, _filter_window, run_walk_forward
 from core.logger import get_logger
 from models import MarketType, Term
 
@@ -197,16 +197,28 @@ async def run_sweep(
         symbols=symbols, n_combos=n_trials,
     )
 
-    # Fetch candle history once per symbol.
+    # Fetch candle history once per symbol. Window-filter HERE so the regime
+    # annotation below is index-aligned with exactly what run_walk_forward
+    # will replay (_filter_window is idempotent on the second application).
     candles_by_symbol: dict[str, list[dict]] = {}
     for sym in symbols:
         candles = await _fetch_history(sym, market, base.signal_interval, n_bars=n_bars)
+        candles = _filter_window(candles, start, end)
         if candles:
             candles_by_symbol[sym] = candles
         else:
             log.warning("sweep.no_candles", symbol=sym)
     if not candles_by_symbol:
         return []
+
+    # Regime annotation is combo-independent — compute ONCE per symbol when
+    # any combo in the grid gates on it (the HMM fit is the expensive part).
+    regime_by_symbol: dict[str, list[float | None]] = {}
+    if any(c.regime_filter is not None for c in combos):
+        from data_fetchers.regime import annotate_regime
+        for sym, candles in candles_by_symbol.items():
+            regime_by_symbol[sym] = annotate_regime(candles)
+            log.info("sweep.regime_annotated", symbol=sym)
 
     results: list[ComboResult] = []
     for i, p in enumerate(combos):
@@ -218,6 +230,7 @@ async def run_sweep(
                 symbol=sym, market=market, term=term,
                 start=start, end=end, n_trials=n_trials,
                 params=p, candles=list(candles),
+                regime_series=regime_by_symbol.get(sym),
             )
             closed = [t.r_multiple for t in res.trades if t.outcome in ("TP", "SL")]
             pooled_r.extend(closed)

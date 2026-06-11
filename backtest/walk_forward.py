@@ -190,6 +190,7 @@ async def run_walk_forward(
     n_trials: int = 1,
     params: TermParams | None = None,
     candles: list[dict] | None = None,
+    regime_series: list[float | None] | None = None,
 ) -> BacktestResult:
     """Replay history bar-by-bar and produce a `BacktestResult`.
 
@@ -230,10 +231,12 @@ async def run_walk_forward(
 
     # Regime annotation — computed ONCE per symbol from filtered (forward-
     # only) HMM probabilities, so the per-bar loop just indexes into it.
-    regime_series: list[float | None] | None = None
-    if p.regime_filter is not None:
+    # Sweeps precompute and pass `regime_series` so 48 combos share one fit.
+    if p.regime_filter is not None and regime_series is None:
         from data_fetchers.regime import annotate_regime
         regime_series = annotate_regime(candles)
+    if p.regime_filter is None:
+        regime_series = None
 
     for idx in range(_WARMUP_BARS, len(candles), _STEP_BARS):
         # If a trade is open, advance it bar-by-bar (don't re-enter).
