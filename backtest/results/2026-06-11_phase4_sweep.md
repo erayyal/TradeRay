@@ -79,6 +79,28 @@ Yorum:
 - Sonuç olarak market_config: CRYPTO→SHORT_TERM (DSR 0.774),
   BIST→MID_TERM (DSR 0.979), SP500/NASDAQ→MID_TERM (gözlem).
 
+## Exit-grid sweep'leri (aynı gün, 3. tur — v3.0)
+
+Giriş parametreleri sabit (yukarıdaki kazananlar), 48 kombo:
+BE ∈ {yok, 0.5, 1.0, 1.5} × hold ∈ {yok, 10, 20, 40 bar} × rejim ∈ {yok, low_vol, high_vol};
+DSR cezası `--n-trials-floor 480` (önceki 432 giriş denemesi sayılıyor).
+
+| Hücre | Baseline | Kazanan exit | Yeni | Uygulanan |
+|---|---|---|---|---|
+| CRYPTO 4h | DSR 0.764, +74R | hold=40 | **0.785**, +74R | ✅ hold=40 |
+| CRYPTO 1d | DSR 0.545, +49R | be=1.5R (+hold=40 nötr) | **0.601**, +51R, win 49.5% | ✅ be=1.5 + hold=40 |
+| BIST 1d | DSR 0.977, +163R, avgR +0.51 | be=1.0R | **0.991**, +160R, avgR **+0.62** | ✅ be=1.0 |
+
+Bulgular:
+- **Breakeven seviyesi TP'ye göre kalibre olmalı**: TP 1.5R olan hücrede BE
+  0.5/1.0R zarar (DSR 0.47/0.53 — kazananları erken kesiyor); TP 2-3R olan
+  hücrelerde BE 1.0-1.5R net kazanç. Davey'nin "breakeven iyi ama bağlama
+  bağlı" bulgusuyla uyumlu.
+- **HMM rejim gate'i her yerde DSR'ı düşürdü** (avg_R ↑ ama n ↓). Gate
+  KAPALI; `regime_p_high` enstrümantasyonu audit'te birikmeye devam ediyor —
+  canlı veriyle yeniden değerlendirilecek.
+- Zaman bariyeri (40 bar) hiçbir hücrede zarar vermedi; CRYPTO'da uygulandı.
+
 ## AUTO_BOT kararı (§11.5)
 
 DSR>0.5 şartı artık sağlanıyor (1/3). Kalan şartlar: ≥2 hafta SIGNAL-only

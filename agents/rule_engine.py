@@ -157,6 +157,10 @@ CRYPTO_PARAMS: dict[Term, TermParams] = {
         adx_max_for_range=18.0,
         vol_target_annual=_VOL_TARGET_CRYPTO,
         periods_per_year=_PPY_CRYPTO["4h"],
+        # v3.0 exit sweep: time barrier only — DSR 0.764→0.785, same +74R
+        # (stragglers closed, capital freed). BE at 0.5/1.0R HURT here
+        # (DSR 0.47/0.53); BE 1.5R is unreachable (TP sits at 1.5R).
+        max_holding_bars=40,
     ),
     Term.MID_TERM: TermParams(
         signal_interval="1d", confirm_interval=None,
@@ -168,6 +172,11 @@ CRYPTO_PARAMS: dict[Term, TermParams] = {
         adx_min_for_trend=20.0,                                # v2.9: 22 → 20
         vol_target_annual=_VOL_TARGET_CRYPTO,
         periods_per_year=_PPY_CRYPTO["1d"],
+        # v3.0 exit sweep: BE at +1.5R + 40-bar cap — DSR 0.545→0.601,
+        # +49→+51R, win 48.2%→49.5% (hold=40 is performance-neutral but
+        # bounds capital lockup).
+        breakeven_at_r=1.5,
+        max_holding_bars=40,
     ),
 }
 
@@ -257,6 +266,9 @@ BIST_PARAMS: dict[Term, TermParams] = {
         adx_min_for_trend=20.0,
         vol_target_annual=_VOL_TARGET_BIST,
         periods_per_year=_PPY_EQUITY["1d"],
+        # v3.0 exit sweep: BE at +1.0R — DSR 0.977→0.991, avg_R +0.51→+0.62
+        # (best risk-adjusted cell in the whole system).
+        breakeven_at_r=1.0,
     ),
 }
 
