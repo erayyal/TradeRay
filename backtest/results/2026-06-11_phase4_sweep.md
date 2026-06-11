@@ -50,6 +50,35 @@ avg_R +0.31..+0.45 sonuçları bunu fazlasıyla karşılıyor.
 US/BIST parametrelerine dokunulmadı (sweep crypto verisiyle yapıldı; equity
 sweep'i yfinance 4h kısıtları nedeniyle ayrı çalışma ister).
 
+## Equity sweep'leri (aynı gün, 2. tur — 10'ar mega-cap)
+
+```
+python -m backtest.sweep <US10>  SP500 SHORT_TERM|MID_TERM 2024-01-01 2026-06-11 --biases HYB,MR / TF,MR
+python -m backtest.sweep <BIST10> BIST SHORT_TERM|MID_TERM 2024-01-01 2026-06-11 --biases HYB,MR / TF,MR
+```
+
+US10: AAPL MSFT NVDA AMZN GOOGL META TSLA AMD AVGO NFLX ·
+BIST10: THYAO ASELS GARAN AKBNK ISCTR TUPRS KCHOL SISE EREGL BIMAS (.IS)
+
+| Market/Term | En iyi kombo | n | win% | avgR | totR | DSR | Karar |
+|---|---|---|---|---|---|---|---|
+| **BIST MID (1d)** | **MR 30/70, atr 1.5, rr 3.0, rvol 0.8** | 317 | 37.9% | **+0.51** | **+163.0** | **0.979** | ✅ UYGULANDI |
+| BIST SHORT (4h) | MR 30/70, atr 1.5, rr 1.5 | 257 | 41.6% | +0.04 | +10.5 | 0.007 | ❌ edge yok |
+| US MID (1d) | MR 30/70, atr 2.0, rr 3.0, rvol 1.2 | 186 | 28.0% | +0.12 | +22.0 | 0.019 | ⚠️ observation-grade |
+| US SHORT (4h) | (en iyisi bile) | 121 | 33.1% | -0.01 | -1.0 | 0.001 | ❌ edge yok / negatif |
+
+Yorum:
+- **BIST günlük mean-reversion çok güçlü** — EM piyasalarında kısa-vadeli
+  overreaction/reversal literatürüyle tutarlı (De Bondt-Thaler 1985,
+  Jegadeesh 1990). Plato geniş: (MR, 30/70, rvol 0.8) ekseninde tüm atr×rr
+  komşuları pozitif; ADX MR'da kullanılmadığından üçüz satırlar normal.
+- **US equity'de bu feature setiyle edge yok.** Mega-cap'ler verimli piyasa;
+  basit RSI/BB/ADX sinyalleri kârlı değil. US MID_TERM observation-grade
+  MR setiyle sinyal üretmeye devam ediyor (sıfır sermaye riski) — canlı veri
+  evrende kalıp kalmayacağına karar verecek.
+- Sonuç olarak market_config: CRYPTO→SHORT_TERM (DSR 0.774),
+  BIST→MID_TERM (DSR 0.979), SP500/NASDAQ→MID_TERM (gözlem).
+
 ## AUTO_BOT kararı (§11.5)
 
 DSR>0.5 şartı artık sağlanıyor (1/3). Kalan şartlar: ≥2 hafta SIGNAL-only

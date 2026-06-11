@@ -180,14 +180,22 @@ EQUITY_US_PARAMS: dict[Term, TermParams] = {
         vol_target_annual=_VOL_TARGET_US_EQUITY,
         periods_per_year=_PPY_EQUITY["4h"],
     ),
+    # v2.9 sweep (2026-06-11, 432 combos × 10 US mega-caps, 2y daily):
+    # NO statistically validated edge on US equities with this feature set —
+    # best combo (MR 30/70, atr 2.0, rr 3.0, rvol 1.2) is mildly positive
+    # in-sample (+22R / 186 trades, avg_R +0.12) but DSR 0.019 after the
+    # multiple-testing penalty. We carry that best set as OBSERVATION-GRADE:
+    # signal-only, zero capital risk, live data decides whether to keep US
+    # in the universe. (4h SHORT_TERM was flat-to-negative across all 432 —
+    # which is why US markets run MID_TERM.)
     Term.MID_TERM: TermParams(
         signal_interval="1d", confirm_interval=None,
-        bias="TF",
-        rsi_period=14, rsi_long_max=45.0, rsi_short_min=55.0,  # v2.7: 40/60 → 45/55
+        bias="MR",
+        rsi_period=14, rsi_long_max=30.0, rsi_short_min=70.0,
         atr_sl_mult=2.0, rr_target=3.0,
         leverage_cap=1, risk_pct=0.02,
-        rel_volume_min=0.9,                                    # v2.7: 1.0 → 0.9
-        adx_min_for_trend=22.0,                                # v2.7: 25 → 22
+        rel_volume_min=1.2,
+        adx_min_for_trend=20.0,
         vol_target_annual=_VOL_TARGET_US_EQUITY,
         periods_per_year=_PPY_EQUITY["1d"],
     ),
@@ -217,14 +225,21 @@ BIST_PARAMS: dict[Term, TermParams] = {
         vol_target_annual=_VOL_TARGET_BIST,
         periods_per_year=_PPY_EQUITY["4h"],
     ),
+    # v2.9 sweep (2026-06-11, 432 combos × 10 BIST mega-caps, 2y daily):
+    # daily MEAN-REVERSION dominates Turkish equities — RSI(14) 30/70 dips
+    # inside the BB tail, wide 3R targets. DSR 0.979, 317 trades, win 37.9%,
+    # avg_R +0.51, +163R pooled, p≈0.000. Plateau: every atr×rr neighbor on
+    # the (MR, 30/70, rvol 0.8) axis positive. Consistent with short-horizon
+    # reversal being strongest in less-efficient EM markets (Jegadeesh 1990;
+    # De Bondt-Thaler 1985 overreaction).
     Term.MID_TERM: TermParams(
         signal_interval="1d", confirm_interval=None,
-        bias="TF",
-        rsi_period=14, rsi_long_max=45.0, rsi_short_min=55.0,  # v2.7: 40/60 → 45/55
-        atr_sl_mult=2.5, rr_target=3.0,                        # BIST mid-term widest stops
+        bias="MR",
+        rsi_period=14, rsi_long_max=30.0, rsi_short_min=70.0,
+        atr_sl_mult=1.5, rr_target=3.0,
         leverage_cap=1, risk_pct=0.015,
-        rel_volume_min=0.9,                                    # v2.7: 1.0 → 0.9
-        adx_min_for_trend=22.0,                                # v2.7: 25 → 22
+        rel_volume_min=0.8,
+        adx_min_for_trend=20.0,
         vol_target_annual=_VOL_TARGET_BIST,
         periods_per_year=_PPY_EQUITY["1d"],
     ),

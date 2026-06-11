@@ -81,17 +81,27 @@
 
   | Term | Sinyal TF / Onay | Bias | RSI eşikleri | ATR SL × | R:R | Risk | Lev | Vol gate |
   |---|---|---|---|---|---|---|---|---|
-  | **SCALP** | 15m / 1h | **MR** | RSI(2): ≤5 / ≥95 (Connors original) | 1.0 | 1.5 | 2% | 1× | **1.5×** |
-  | **SHORT_TERM** | 4h / 1d | **HYB** | RSI(14): ≤35 / ≥65 | 1.5 | 2.0 | 2% | 1× | 1.3× |
-  | **MID_TERM** | 1d / — | **TF** | RSI(14): ≤40 / ≥60 + ADX>25 | 2.0 | 3.0 | 2% | 1× | 1.0× |
+  | **SCALP** | 15m / 1h | **MR** | RSI(2): ≤10 / ≥90 | 1.0 | 1.5 | 2% | 1× | 1.2× |
+  | **SHORT_TERM** | 4h / 1d | **HYB** | RSI(14): ≤40 / ≥60 | 1.5 | 2.0 | 2% | 1× | 1.0× |
+  | **MID_TERM** | 1d / — | **MR** | RSI(14): ≤30 / ≥70 | **2.0** | **3.0** | 2% | 1× | **1.2×** |
+
+  > **v2.9 sweep bulgusu (US):** 432 kombo × 10 mega-cap'te istatistiksel
+  > anlamlı edge YOK (en iyi DSR 0.019). MID_TERM MR seti observation-grade
+  > olarak çalışır (signal-only); 4h flat/negatif olduğundan US marketleri
+  > MID_TERM'e alındı. Canlı veri evrende kalma kararını verecek.
 
   ### 2.3 BIST (.IS)
 
   | Term | Sinyal TF / Onay | Bias | RSI eşikleri | **ATR SL ×** | R:R | **Risk** | Lev | Vol gate |
   |---|---|---|---|---|---|---|---|---|
-  | **SCALP** | 15m / 1h | MR | RSI(2): ≤10 / ≥90 | **2.0** | 1.5 | **1.5%** | 1× | 1.5× |
-  | **SHORT_TERM** | 4h / 1d | HYB | RSI(14): ≤35 / ≥65 | **2.0** | 2.0 | **1.5%** | 1× | 1.3× |
-  | **MID_TERM** | 1d / — | TF | RSI(14): ≤40 / ≥60 + ADX>25 | **2.5** | 3.0 | **1.5%** | 1× | 1.0× |
+  | **SCALP** | 15m / 1h | MR | RSI(2): ≤15 / ≥85 | **2.0** | 1.5 | **1.5%** | 1× | 1.2× |
+  | **SHORT_TERM** | 4h / 1d | HYB | RSI(14): ≤40 / ≥60 | **2.0** | 2.0 | **1.5%** | 1× | 1.0× |
+  | **MID_TERM** | 1d / — | **MR** | **RSI(14): ≤30 / ≥70** | **1.5** | 3.0 | **1.5%** | 1× | **0.8×** |
+
+  > **v2.9 sweep bulgusu (BIST):** günlük mean-reversion ÇOK güçlü —
+  > **DSR 0.979, 317 trade, avg_R +0.51, +163R** (10 mega-cap, 2 yıl).
+  > EM kısa-vadeli overreaction literatürüyle tutarlı (De Bondt-Thaler 1985).
+  > BIST market'i bu yüzden MID_TERM'de çalışır.
 
   > **Neden BIST'te daha geniş stop + düşük risk?** TR equity'leri gap riski + mid/small-cap likidite + TCMB/USDTRY makro vol → AQR-style vol-targeting mantığı, IMF EM coupling literatürü.
 
