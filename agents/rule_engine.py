@@ -126,26 +126,31 @@ CRYPTO_PARAMS: dict[Term, TermParams] = {
         vol_target_annual=_VOL_TARGET_CRYPTO,
         periods_per_year=_PPY_CRYPTO["15m"],
     ),
+    # v2.9 (2026-06-11): SHORT_TERM + MID_TERM parameters set from the Phase 4
+    # walk-forward sweep (432 combos × 3 symbols, DSR-ranked with full
+    # multiple-testing penalty — backtest/results/2026-06-11_phase4_sweep.md).
+    # Both winning sets sit on broad positive plateaus (11-12/12 neighboring
+    # atr×rr combos positive; every symbol individually positive).
     Term.SHORT_TERM: TermParams(
         signal_interval="4h", confirm_interval="1d",
         bias="HYB",
-        rsi_period=14, rsi_long_max=40.0, rsi_short_min=60.0,  # v2.7: 35/65 → 40/60
-        atr_sl_mult=1.5, rr_target=2.0,
+        rsi_period=14, rsi_long_max=40.0, rsi_short_min=60.0,
+        atr_sl_mult=2.0, rr_target=1.5,                        # v2.9: 1.5/2.0 → 2.0/1.5 (DSR 0.774)
         leverage_cap=3, risk_pct=0.02,
-        rel_volume_min=1.0,                                    # v2.7: 1.2 → 1.0
-        adx_min_for_trend=22.0,                                # v2.7: 25 → 22
-        adx_max_for_range=18.0,                                # v2.7: 20 → 18 (wider trans. band)
+        rel_volume_min=0.8,                                    # v2.9: 1.0 → 0.8
+        adx_min_for_trend=20.0,                                # v2.9: 22 → 20
+        adx_max_for_range=18.0,
         vol_target_annual=_VOL_TARGET_CRYPTO,
         periods_per_year=_PPY_CRYPTO["4h"],
     ),
     Term.MID_TERM: TermParams(
         signal_interval="1d", confirm_interval=None,
         bias="TF",
-        rsi_period=14, rsi_long_max=45.0, rsi_short_min=55.0,  # v2.7: 40/60 → 45/55
-        atr_sl_mult=2.0, rr_target=3.0,
+        rsi_period=14, rsi_long_max=45.0, rsi_short_min=55.0,
+        atr_sl_mult=1.5, rr_target=2.0,                        # v2.9: 2.0/3.0 → 1.5/2.0 (DSR 0.545)
         leverage_cap=2, risk_pct=0.02,
-        rel_volume_min=0.9,                                    # v2.7: 1.0 → 0.9
-        adx_min_for_trend=22.0,                                # v2.7: 25 → 22
+        rel_volume_min=0.8,                                    # v2.9: 0.9 → 0.8
+        adx_min_for_trend=20.0,                                # v2.9: 22 → 20
         vol_target_annual=_VOL_TARGET_CRYPTO,
         periods_per_year=_PPY_CRYPTO["1d"],
     ),

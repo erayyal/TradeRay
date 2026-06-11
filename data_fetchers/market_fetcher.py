@@ -77,12 +77,14 @@ def lookbacks_for(interval: str) -> dict:
 # yfinance bulk download. These cover the main flow that drives the index.
 # ---------------------------------------------------------------------------
 
+# KOZAL.IS / KOZAA.IS removed 2026-06-11 — Yahoo returns 404/"possibly
+# delisted" for both, polluting every BIST cycle's logs with fetch errors.
 BIST_POOL: list[str] = [
     "THYAO.IS", "ASELS.IS", "GARAN.IS", "ISCTR.IS", "AKBNK.IS",
     "YKBNK.IS", "KCHOL.IS", "SAHOL.IS", "EREGL.IS", "BIMAS.IS",
-    "FROTO.IS", "TUPRS.IS", "ARCLK.IS", "KOZAL.IS", "SISE.IS",
+    "FROTO.IS", "TUPRS.IS", "ARCLK.IS", "SISE.IS",
     "PETKM.IS", "TCELL.IS", "EKGYO.IS", "HEKTS.IS", "KRDMD.IS",
-    "ENJSA.IS", "AEFES.IS", "MGROS.IS", "TKFEN.IS", "KOZAA.IS",
+    "ENJSA.IS", "AEFES.IS", "MGROS.IS", "TKFEN.IS",
     "TOASO.IS", "VESTL.IS", "PGSUS.IS", "TAVHL.IS", "HALKB.IS",
 ]
 

@@ -1,4 +1,4 @@
-  # TradeRay — Karar Algoritması (v2.8 — portfolio risk overlay + AI verifier disiplini + sweep harness)
+  # TradeRay — Karar Algoritması (v2.9 — Phase 4 sweep parametreleri canlıda)
 
   > **Bu dosya: bot şu anda trade ve sinyali NEYE göre üretir?**
   >
@@ -7,14 +7,22 @@
   >   alignment + ADX rejim filtresi + volume gate + Connors RSI(2).
   > - v2.5: Phase 3 — VIX/FOMC/TCMB/Earnings/Funding gate'leri + vol-targeting
   >   kod yolu + Chandelier trailing + walk-forward backtest harness.
-  > - **v2.6 (bu sürüm) — Phase 3.5:** vol-targeting **AKTİF** (Carver-style
-  >   defaults), rule-only thesis-broken cancel, LLM daily cost budget alarm,
-  >   pytest suite (45 test), backtest harness gerçek veriyle çalıştırıldı.
+  > - v2.6 — Phase 3.5: vol-targeting AKTİF (Carver-style defaults), rule-only
+  >   thesis-broken cancel, LLM daily cost budget alarm, pytest suite.
+  > - v2.7: gözlem-kalitesi eşik gevşetme (SIGNAL-only veri akışı için).
+  > - v2.8: portfolio risk overlay (günlük zarar limiti + SL cooldown +
+  >   concurrency cap), AI verifier guardrail'leri (confidence floor, yön
+  >   flip→WAIT, risk clamp), per-agent model routing (Haiku/Opus),
+  >   sentiment cache, parametre sweep harness.
+  > - **v2.9 (bu sürüm) — Phase 4-a/4-b tamamlandı:** CRYPTO SHORT_TERM ve
+  >   MID_TERM parametreleri 432-kombo walk-forward sweep'ten DSR>0.5 ile
+  >   seçildi (`backtest/results/2026-06-11_phase4_sweep.md`). MR-on-daily
+  >   alternatifi test edildi ve REDDEDİLDİ (en iyi MR DSR 0.053).
   >
-  > **⚠️ Üretim notu:** Phase 3.5 backtest smoke testi mevcut MID_TERM crypto
-  > parametrelerinin **negatif Sharpe** verdiğini gösteriyor. AUTO_BOT bu
-  > parametrelerle açılmamalı — SIGNAL-only mode kullan, Phase 4'te parametre
-  > sweep'inden sonra AUTO_BOT'a geç. Detaylar §11'de.
+  > **Üretim notu:** DSR>0.5 şartı sağlandı (§11.5'in 1/3 şartı). AUTO_BOT
+  > için kalan şartlar: ≥2 hafta pozitif SIGNAL-only canlı izleme + cost
+  > budget uyumu. Canlı veri 2026-06-10 sıfırlamasından itibaren temiz
+  > birikmekte.
 
   > 🎓 = peer-reviewed academic | 🏛 = kurumsal araştırma | 🛠 = uygulayıcı
 
@@ -60,9 +68,14 @@
 
   | Term | Sinyal TF / Onay | Bias | RSI(period) eşikleri | ATR SL × | R:R | Risk | Lev | Vol gate | Atıf |
   |---|---|---|---|---|---|---|---|---|---|
-  | **SCALP** | 15m / 1h | **MR** | RSI(2): ≤10 LONG, ≥90 SHORT | 1.0 | 1.5 | 2% | 3× | 1.2× | Connors-Alvarez 2008 🛠 |
-  | **SHORT_TERM** | 4h / 1d | **HYB** | RSI(14): ≤35 / ≥65 | 1.5 | 2.0 | 2% | 3× | 1.2× | Wilder DMI 🛠 + MOP 2012 🎓 |
-  | **MID_TERM** | 1d / — | **TF** | RSI(14): ≤40 / ≥60 + ADX>25 | 2.0 | 3.0 | 2% | 2× | 1.0× | MOP 2012, AMP 2013 🎓 |
+  | **SCALP** | 15m / 1h | **MR** | RSI(2): ≤15 LONG, ≥85 SHORT | 1.0 | 1.5 | 2% | 3× | 1.0× | Connors-Alvarez 2008 🛠 |
+  | **SHORT_TERM** | 4h / 1d | **HYB** | RSI(14): ≤40 / ≥60, ADX≥20/≤18 | **2.0** | **1.5** | 2% | 3× | **0.8×** | **v2.9 sweep: DSR 0.774, 241 trade, p≈0.000** |
+  | **MID_TERM** | 1d / — | **TF** | RSI(14): ≤45 / ≥55 + ADX≥20 | **1.5** | **2.0** | 2% | 2× | **0.8×** | **v2.9 sweep: DSR 0.545, 110 trade, p=0.002** |
+
+  > v2.9 parametre seçimi tamamen ampirik: 432 kombo × 3 sembol walk-forward,
+  > DSR sıralaması (çoklu-test cezalı). Her iki kazanan set geniş pozitif
+  > plato üzerinde (komşu atr×rr kombolarının 11-12/12'si pozitif) ve her
+  > sembol tek tek pozitif — tek şanslı nokta değil.
 
   ### 2.2 SP500 & NASDAQ
 

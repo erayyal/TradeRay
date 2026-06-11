@@ -6,9 +6,28 @@
 
 ---
 
-## 1. Durum (2026-06-11 güncellemesi)
+## 1. Durum (2026-06-11 güncellemesi — v2.9)
 
-**Sürüm**: v2.8 — portfolio risk overlay + AI verifier disiplini + sweep harness.
+**Sürüm**: v2.9 — Phase 4 sweep parametreleri CANLIDA.
+
+v2.9 (2026-06-11):
+- **Veri sıfırlandı** (2026-06-10 22:00 UTC): signals/trades/decision_audits/
+  llm_cost_logs TRUNCATE + Redis decision:*/cost:* temizlendi. market_config
+  ve system_enabled KORUNDU. Tüm canlı veri yeni algoritma dönemine ait.
+- **Sweep sonuçları uygulandı** (`backtest/results/2026-06-11_phase4_sweep.md`):
+  - CRYPTO SHORT_TERM: HYB, atr 2.0, rr 1.5, adx≥20, rvol 0.8 →
+    backtest DSR 0.774, 241 trade, win 52.3%, +74R, p≈0.000.
+  - CRYPTO MID_TERM: TF, atr 1.5, rr 2.0, adx≥20, rvol 0.8 →
+    DSR 0.545, 110 trade, win 48.2%, +49R, p=0.002.
+  - MR-on-daily (Phase 4-b) REDDEDİLDİ (en iyi DSR 0.053).
+  - US/BIST parametrelerine dokunulmadı (crypto verisiyle sweep yapıldı).
+- **UI**: yeni "📈 Performans" sekmesi — açık sinyaller (anlık K/Z, TP/SL
+  uzaklık), sonuçlananlar (R, süre), market×term kırılım. Kullanıcı işlem
+  açmadan takip edecek.
+- AUTO_BOT hâlâ KAPALI: §11.5'in DSR şartı sağlandı; kalan şart ≥2 hafta
+  pozitif SIGNAL-only canlı izleme (2026-06-24'ten önce açma).
+
+**v2.8 mirası**: portfolio risk overlay + AI verifier disiplini + sweep harness.
 
 v2.8 ile eklenenler (detay: `ALGORITHM.md` §8C):
 - `execution/portfolio_guard.py` — günlük zarar kill-switch (%3), SL cooldown,
