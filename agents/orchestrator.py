@@ -631,13 +631,45 @@ async def _persist_audit(
     decision: dict[str, Any] | None,
     result: dict[str, Any] | None,
 ) -> None:
-    """Build the audit row from the in-flight trace + final result, then write it."""
+    """Build the audit row from the in-flight trace + final result, then write it.
+
+    WAIT dedup: with bar-close-aligned cron scheduling the cycle fires up to
+    4x more often than the signal TF actually changes, so consecutive ticks
+    produce byte-identical WAITs. We keep ONE audit row per distinct
+    (decision, justification) state per symbol - a repeat within the Redis
+    key's 24h TTL is skipped; any change in reason (or any non-WAIT outcome)
+    is always written.
+    """
     category, mode_enum, outcome, reason = _classify_audit(
         decision=decision or {},
         result=result,
         use_ai=use_ai,
         execution_mode=execution_mode,
     )
+
+    action = (decision or {}).get("decision", "WAIT")
+    if action == "WAIT":
+        state = f"WAIT|{reason}"
+        dedup_key = f"audit:last:{market.value}:{symbol}"
+        try:
+            prev = await cache.client.get(dedup_key)
+            if prev == state:
+                log.debug(
+                    "orchestrator.audit_dedup_skip", symbol=symbol,
+                    market=market.value,
+                )
+                return
+            await cache.client.set(dedup_key, state, ex=24 * 3600)
+        except Exception as e:
+            log.debug("orchestrator.audit_dedup_failed", err=str(e))
+    else:
+        # Actionable outcome - reset the dedup state so the NEXT wait after
+        # a signal is always recorded (it explains why the streak ended).
+        try:
+            await cache.client.delete(f"audit:last:{market.value}:{symbol}")
+        except Exception:
+            pass
+
     await log_decision_audit(
         category=category,
         market=market,

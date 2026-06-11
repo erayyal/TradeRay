@@ -66,13 +66,39 @@ log = get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Term → tick interval (seconds) for market-cycle jobs.
+# Term → bar-close-aligned cron schedule for market-cycle jobs.
+#
+# Why cron instead of IntervalTrigger: interval jobs anchor to PROCESS START,
+# so every signal lands on the same arbitrary minute-of-hour (the "all signals
+# at xx:35" artifact) and a MID_TERM check could run up to 23h after the
+# daily bar actually closed. The rule engine drops the still-forming bar, so
+# decision inputs only change when a signal-TF bar CLOSES — the professional
+# cadence is therefore "minutes after each possible bar close":
+#
+#   SCALP      (15m TF): every 5 min, :30s offset → close detected ≤ ~1 min.
+#   SHORT_TERM (4h TF) : :01/:16/:31/:46 hourly grid → crypto 4h closes
+#                        (00/04/08/12/16/20 UTC) detected in 1 min; equity
+#                        session-anchored 4h bars within ≤15 min.
+#   MID_TERM   (1d TF) : hourly at :02 → crypto daily close (00:00 UTC)
+#                        detected in 2 min; equity daily closes within ≤1h.
+#
+# Extra ticks between closes recompute identical closed-bar indicators and
+# short-circuit to WAIT (zero LLM cost; WAIT-audit dedup in the orchestrator
+# keeps the audit table from quadrupling).
 # ---------------------------------------------------------------------------
 
+TERM_CRON: dict[Term, dict[str, str | int]] = {
+    Term.SCALP:      {"minute": "*/5", "second": 30},
+    Term.SHORT_TERM: {"minute": "1,16,31,46"},
+    Term.MID_TERM:   {"minute": "2"},
+}
+
+# Legacy export — a few callers/tests import this for documentation purposes.
+# Effective worst-case detection latency per term under TERM_CRON.
 TERM_INTERVAL_SECONDS: dict[Term, int] = {
     Term.SCALP: 5 * 60,
-    Term.SHORT_TERM: 60 * 60,
-    Term.MID_TERM: 24 * 60 * 60,
+    Term.SHORT_TERM: 15 * 60,
+    Term.MID_TERM: 60 * 60,
 }
 
 # Tracker jobs all run on the same 5-minute heartbeat. Cheap, and frequent
@@ -314,10 +340,10 @@ async def configure_jobs(scheduler: AsyncIOScheduler) -> None:
                 log.info("scheduler.job_disabled", job_id=jid)
             continue
 
-        seconds = TERM_INTERVAL_SECONDS[cfg.term]
+        cron = TERM_CRON[cfg.term]
         scheduler.add_job(
             _market_cycle_job,
-            trigger=IntervalTrigger(seconds=seconds),
+            trigger=CronTrigger(timezone="UTC", **cron),
             args=[cfg.market.value],
             id=jid,
             name=f"{cfg.market.value} ({cfg.term.value})",
@@ -331,7 +357,7 @@ async def configure_jobs(scheduler: AsyncIOScheduler) -> None:
             job_id=jid,
             market=cfg.market.value,
             term=cfg.term.value,
-            interval_seconds=seconds,
+            cron=str(cron),
             execution_mode=cfg.execution_mode.value,
             symbols=cfg.symbols,
         )
@@ -608,6 +634,7 @@ __all__ = [
     "configure_jobs",
     "reload_jobs",
     "send_daily_digest",
+    "TERM_CRON",
     "TERM_INTERVAL_SECONDS",
     "TRACKER_INTERVAL_SECONDS",
     "CHANDELIER_INTERVAL_SECONDS",
