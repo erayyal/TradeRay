@@ -1,4 +1,4 @@
-  # TradeRay — Karar Algoritması (v2.9 — Phase 4 sweep parametreleri canlıda)
+  # TradeRay — Karar Algoritması (v3.0 — exit mühendisliği + HMM rejim + drift bekçisi)
 
   > **Bu dosya: bot şu anda trade ve sinyali NEYE göre üretir?**
   >
@@ -19,10 +19,20 @@
   >   seçildi (`backtest/results/2026-06-11_phase4_sweep.md`). MR-on-daily
   >   alternatifi test edildi ve REDDEDİLDİ (en iyi MR DSR 0.053).
   >
+  > - **v3.0 (bu sürüm):** (1) **Exit mühendisliği** — breakeven-at-R +
+  >   zaman bariyeri (López de Prado triple-barrier; Davey 567k-backtest)
+  >   harness'te sweep'lenebilir, tracker canlı mirror'lı, gerçek trade'de
+  >   Chandelier'a entegre BE tabanı. (2) **HMM rejim filtresi** (Hamilton
+  >   1989, saf numpy Baum-Welch, FILTERED olasılık — lookahead yok).
+  >   (3) **Fear&Greed** (alternative.me, ücretsiz) enstrümantasyonu +
+  >   **BIST earnings blackout**. (4) **Aylık otomatik drift re-sweep**
+  >   (Lo 2004 AMH) — Telegram raporu, otomatik uygulama yok.
+  >
   > **Üretim notu:** DSR>0.5 şartı sağlandı (§11.5'in 1/3 şartı). AUTO_BOT
   > için kalan şartlar: ≥2 hafta pozitif SIGNAL-only canlı izleme + cost
   > budget uyumu. Canlı veri 2026-06-10 sıfırlamasından itibaren temiz
-  > birikmekte.
+  > birikmekte. Exit/rejim politikaları yalnızca sweep'te baseline'ı
+  > geçtikleri hücrede aktif (sonuçlar: backtest/results/).
 
   > 🎓 = peer-reviewed academic | 🏛 = kurumsal araştırma | 🛠 = uygulayıcı
 

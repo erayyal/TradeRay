@@ -377,6 +377,9 @@ async def configure_jobs(scheduler: AsyncIOScheduler) -> None:
     # ---- 3. Daily Telegram digest (midnight UTC) ----------------------------
     _configure_digest_job(scheduler)
 
+    # ---- 4. Monthly parameter-drift re-sweep (1st, 03:10 UTC) ---------------
+    _configure_resweep_job(scheduler)
+
 
 def _configure_tracker_jobs(scheduler: AsyncIOScheduler) -> None:
     """Register the three tracker jobs.
@@ -627,6 +630,37 @@ def _configure_digest_job(scheduler: AsyncIOScheduler) -> None:
         misfire_grace_time=600,
     )
     log.info("scheduler.digest_job_scheduled", job_id=_DIGEST_JOB_ID, tz="Europe/Istanbul")
+
+
+_RESWEEP_JOB_ID: str = "maintenance:monthly_resweep"
+
+
+async def _monthly_resweep_job_wrapper() -> None:
+    """Shielded wrapper — a sweep crash must never propagate into APScheduler."""
+    try:
+        from scheduler.resweep import run_monthly_resweep
+        await run_monthly_resweep()
+    except Exception as e:
+        log.exception("scheduler.resweep.crashed", err=str(e))
+
+
+def _configure_resweep_job(scheduler: AsyncIOScheduler) -> None:
+    """Monthly drift check (Lo 2004 AMH: edges decay — re-validate, don't trust).
+
+    Runs in subprocesses (see scheduler/resweep.py) so the CPU-bound sweeps
+    can't stall the event loop. Telegram-only output; no auto-apply.
+    """
+    scheduler.add_job(
+        _monthly_resweep_job_wrapper,
+        trigger=CronTrigger(day=1, hour=3, minute=10, timezone="UTC"),
+        id=_RESWEEP_JOB_ID,
+        name="Maintenance: monthly parameter-drift re-sweep (Telegram report)",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=6 * 3600,
+    )
+    log.info("scheduler.resweep_job_scheduled", job_id=_RESWEEP_JOB_ID)
 
 
 __all__ = [

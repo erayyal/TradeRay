@@ -199,11 +199,19 @@ async def notify_trade_closed(
     await send_message(text)
 
 
+_OUTCOME_LABELS: dict[str, str] = {
+    "TP": "Take Profit ✅",
+    "SL": "Stop Loss ❌",
+    "BE": "Breakeven Stop ⚖️",
+    "TIME": "Time Exit ⏱",
+}
+
+
 async def notify_signal_resolved(
     *, market: str, symbol: str, outcome: str, pnl_usd: float
 ) -> None:
     """🏁 [BIST] RESOLVED: THYAO.IS hit Stop Loss (Theoretical: -$15.00)"""
-    label = "Take Profit ✅" if outcome == "TP" else "Stop Loss ❌"
+    label = _OUTCOME_LABELS.get(outcome, outcome)
     text = (
         f"🏁 *\\[{escape_md2(market)}\\] RESOLVED: {escape_md2(symbol)} hit {escape_md2(label)}*\n"
         f"Theoretical: {_code(_fmt_signed_usd(pnl_usd))}"

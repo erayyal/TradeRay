@@ -962,7 +962,7 @@ def render_performance_tab(
             outcome = res.get("outcome")
             if outcome == "TP":
                 wins += 1
-            else:
+            elif outcome == "SL":
                 losses += 1
             resolved_at = res.get("resolved_at")
             try:
@@ -977,7 +977,12 @@ def render_performance_tab(
                 "Piyasa": s["market"],
                 "Sembol": s["symbol"],
                 "Yön": "⬆ LONG" if is_long else "⬇ SHORT",
-                "Sonuç": "✅ TP (kâr)" if outcome == "TP" else "🛑 SL (zarar)",
+                "Sonuç": {
+                    "TP": "✅ TP (kâr)",
+                    "SL": "🛑 SL (zarar)",
+                    "BE": "⚖️ Başabaş stop",
+                    "TIME": "⏱ Süre doldu",
+                }.get(outcome, str(outcome)),
                 "Giriş": round(entry, 4),
                 "Çıkış": round(res.get("exit_price") or 0, 4),
                 "K/Z (USD)": round(pnl, 2),

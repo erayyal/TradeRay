@@ -59,6 +59,8 @@ from data_fetchers.earnings_fetcher import fetch_next_earnings_date
 from data_fetchers.fred_fetcher import fetch_fred
 from data_fetchers.market_fetcher import fetcher, lookbacks_for
 from data_fetchers.news_fetcher import fetch_latest_news
+from data_fetchers.fear_greed import fetch_fear_greed
+from data_fetchers.regime import latest_p_high
 from data_fetchers.technicals import compute_indicators
 from execution.engine import engine
 from execution.tracker import (
@@ -341,6 +343,10 @@ async def _fetch_macro_lite(market: MarketType) -> dict[str, Any]:
         usdtry = await _safe("macro_lite_usdtry", fetcher.fetch_usdtry())
         if usdtry:
             out["usdtry"] = usdtry
+    if market == MarketType.CRYPTO:
+        fng = await _safe("macro_lite_fng", fetch_fear_greed())
+        if fng:
+            out["fear_greed"] = fng
     return out
 
 
@@ -558,6 +564,8 @@ def _extract_indicator_snapshot(
         "bb_position": primary.get("bb_position"),
         # Volume (NEW)
         "rel_volume": primary.get("rel_volume"),
+        # HMM vol-regime (v3.0)
+        "regime_p_high": primary.get("regime_p_high"),
     }
 
 
@@ -755,6 +763,18 @@ async def run_symbol_cycle(
         )
         return None
 
+    # HMM regime annotation on the primary interval (Hamilton 1989) — read
+    # by the rule engine's regime gate and recorded in the audit snapshot.
+    # Off-thread: the EM fit is ~50-100ms of pure numpy per symbol.
+    primary_candles_for_regime = ohlcv.get(primary_iv) or []
+    if primary_candles_for_regime and not (indicators.get(primary_iv) or {}).get("error"):
+        p_high = await _safe(
+            f"regime:{symbol}",
+            asyncio.to_thread(latest_p_high, primary_candles_for_regime),
+        )
+        if p_high is not None:
+            indicators[primary_iv]["regime_p_high"] = p_high
+
     # Snapshot indicators for the audit row
     trace["indicators"] = _extract_indicator_snapshot(indicators, primary_iv)
 
@@ -763,7 +783,10 @@ async def run_symbol_cycle(
     # Earnings is yfinance + 24h Redis cache → at most one fetch per symbol/day.
     macro_lite = await _fetch_macro_lite(market)
     next_earnings: str | None = None
-    if market in (MarketType.SP500, MarketType.NASDAQ):
+    if market in (MarketType.SP500, MarketType.NASDAQ, MarketType.BIST):
+        # BIST (v3.0): yfinance covers earnings dates for most mega-cap .IS
+        # tickers; coverage gaps fail-open (no blackout). KAP RSS is the
+        # upgrade path if coverage proves too thin.
         next_earnings = await _safe(
             f"earnings:{symbol}", fetch_next_earnings_date(symbol)
         )
@@ -775,6 +798,7 @@ async def run_symbol_cycle(
         )
         if funding:
             macro_lite["funding_rate"] = funding
+    trace["macro"] = macro_lite
 
     # 3. Pending-order lookup (need it for cache + master prompt)
     pending_order = await _safe(

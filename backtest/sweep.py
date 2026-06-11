@@ -111,7 +111,66 @@ def _combo_label(p: TermParams) -> dict[str, Any]:
         "rel_volume_min": p.rel_volume_min,
         "rsi_long_max": p.rsi_long_max,
         "rsi_short_min": p.rsi_short_min,
+        "breakeven_at_r": p.breakeven_at_r,
+        "max_holding_bars": p.max_holding_bars,
+        "regime_filter": p.regime_filter,
     }
+
+
+# ---------------------------------------------------------------------------
+# Exit-grid mode (v3.0): ENTRY params are frozen at the production values;
+# the grid runs over the exit/regime policy axes instead. Used after the
+# entry sweep has picked a validated set — exits are tuned on top of it.
+# ---------------------------------------------------------------------------
+
+def _parse_float_grid(s: str) -> list[float | None]:
+    out: list[float | None] = []
+    for tok in s.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        v = float(tok)
+        out.append(None if v == 0 else v)
+    return out
+
+
+def _parse_int_grid(s: str) -> list[int | None]:
+    out: list[int | None] = []
+    for tok in s.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        v = int(tok)
+        out.append(None if v == 0 else v)
+    return out
+
+
+def _parse_regime_grid(s: str) -> list[str | None]:
+    out: list[str | None] = []
+    for tok in s.split(","):
+        tok = tok.strip().lower()
+        if not tok:
+            continue
+        out.append(None if tok == "none" else tok)
+    return out
+
+
+def _build_exit_combos(
+    base: TermParams,
+    *,
+    be_grid: list[float | None],
+    time_grid: list[int | None],
+    regime_grid: list[str | None],
+) -> list[TermParams]:
+    combos: list[TermParams] = []
+    for be, hold, regime in itertools.product(be_grid, time_grid, regime_grid):
+        combos.append(dataclasses.replace(
+            base,
+            breakeven_at_r=be,
+            max_holding_bars=hold,
+            regime_filter=regime,  # type: ignore[arg-type]
+        ))
+    return combos
 
 
 async def run_sweep(
@@ -123,10 +182,16 @@ async def run_sweep(
     end: datetime | None,
     biases: Sequence[str],
     n_bars: int = 1500,   # Binance futures klines hard cap per request
+    combos: list[TermParams] | None = None,
+    n_trials_floor: int = 0,
 ) -> list[ComboResult]:
     base = params_for(market, term)
-    combos = _build_combos(base, biases)
-    n_trials = len(combos)
+    if combos is None:
+        combos = _build_combos(base, biases)
+    # The DSR penalty must reflect EVERY variant tried across the campaign,
+    # not just this run — `n_trials_floor` lets exit sweeps inherit the 432
+    # entry-grid trials already spent on the same data.
+    n_trials = max(len(combos), n_trials_floor)
     log.info(
         "sweep.start", market=market.value, term=term.value,
         symbols=symbols, n_combos=n_trials,
@@ -191,12 +256,21 @@ def _print_report(results: list[ComboResult], top: int) -> None:
           f"{'rsi':>9} {'n':>4} {'win%':>6} {'avgR':>6} {'totR':>7} {'Sharpe':>7} {'p':>6} {'DSR':>6}")
     for rank, r in enumerate(results[:top], 1):
         c = r.combo
+        exit_suffix = ""
+        if c.get("breakeven_at_r") is not None or c.get("max_holding_bars") is not None \
+                or c.get("regime_filter") is not None:
+            exit_suffix = (
+                f"  be={c.get('breakeven_at_r') or '-'} "
+                f"hold={c.get('max_holding_bars') or '-'} "
+                f"reg={c.get('regime_filter') or '-'}"
+            )
         print(
             f"{rank:>4} {c['bias']:>4} {c['atr_sl_mult']:>4} {c['rr_target']:>4} "
             f"{c['adx_min_for_trend']:>5} {c['rel_volume_min']:>5} "
             f"{c['rsi_long_max']:.0f}/{c['rsi_short_min']:.0f}".rjust(0)
             + f" {r.n_closed:>4} {r.win_rate:>6.1%} {r.avg_r:>+6.2f} {r.total_r:>+7.1f} "
             f"{r.sharpe_ann:>+7.2f} {r.pvalue:>6.3f} {r.dsr:>6.3f}"
+            + exit_suffix
         )
     # Decision guidance (§11.5 ALGORITHM.md): DSR > 0.5 required for AUTO_BOT.
     best = results[0] if results else None
@@ -218,20 +292,43 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--n-bars", type=int, default=1500)
     p.add_argument("--top", type=int, default=10)
     p.add_argument("--json", default=None, help="write full ranked results here")
+    # Exit-grid mode — freeze production entry params, sweep exit/regime axes.
+    p.add_argument("--exit-grid", action="store_true",
+                   help="sweep exits (BE/time/regime) on top of production entry params")
+    p.add_argument("--be-grid", default="0,0.5,1.0,1.5",
+                   help="breakeven_at_r values; 0 = off")
+    p.add_argument("--time-grid", default="0,10,20,40",
+                   help="max_holding_bars values; 0 = off")
+    p.add_argument("--regime-grid", default="none,low_vol,high_vol",
+                   help="regime_filter values")
+    p.add_argument("--n-trials-floor", type=int, default=0,
+                   help="minimum n_trials for DSR (count prior sweeps on same data)")
     return p
 
 
 async def _amain(argv: list[str]) -> int:
     args = _build_parser().parse_args(argv)
+    market = MarketType(args.market)
+    term = Term(args.term)
+    combos: list[TermParams] | None = None
+    if args.exit_grid:
+        combos = _build_exit_combos(
+            params_for(market, term),
+            be_grid=_parse_float_grid(args.be_grid),
+            time_grid=_parse_int_grid(args.time_grid),
+            regime_grid=_parse_regime_grid(args.regime_grid),
+        )
     try:
         results = await run_sweep(
             symbols=[s.strip().upper() for s in args.symbols.split(",") if s.strip()],
-            market=MarketType(args.market),
-            term=Term(args.term),
+            market=market,
+            term=term,
             start=datetime.strptime(args.start, "%Y-%m-%d"),
             end=datetime.strptime(args.end, "%Y-%m-%d"),
             biases=[b.strip().upper() for b in args.biases.split(",") if b.strip()],
             n_bars=args.n_bars,
+            combos=combos,
+            n_trials_floor=args.n_trials_floor,
         )
     finally:
         try:

@@ -53,7 +53,9 @@ class Trade:
     exit_idx: int | None = None
     exit_time_ms: int | None = None
     exit_price: float | None = None
-    outcome: Literal["TP", "SL", "OPEN"] = "OPEN"
+    # BE   = breakeven stop hit after arming (r ≈ 0)
+    # TIME = time-barrier exit at bar close (r = signed close-vs-entry / risk)
+    outcome: Literal["TP", "SL", "BE", "TIME", "OPEN"] = "OPEN"
     r_multiple: float = 0.0
 
 
@@ -89,39 +91,67 @@ def _params_for_backtest(market: MarketType, term: Term) -> TermParams:
 
 def _resolve_forward(
     trade: Trade, candles: list[dict], start_idx: int,
+    *,
+    breakeven_at_r: float | None = None,
+    max_holding_bars: int | None = None,
 ) -> Trade:
-    """Walk bars after `start_idx` until TP or SL touches.
+    """Walk bars after `start_idx` until an exit triggers.
 
-    Conservative tie-break: if TP and SL are both in the same bar's [low, high],
-    we credit the SL (worse case for the strategy). This matches the
-    intra-bar uncertainty handling in `tracker._resolve_one_signal`.
+    Exit priority WITHIN a bar (conservative — SL wins all ambiguity):
+      1. Stop (original SL, or entry once breakeven armed) → "SL" / "BE"
+      2. Take-profit                                        → "TP"
+      3. Time barrier: bars_held ≥ max_holding_bars         → "TIME" @ close
+      4. Breakeven trigger (+X·R favorable excursion) arms the stop for the
+         NEXT bar — never the same bar (intrabar path is unknowable; same-bar
+         arming would be optimistic).
+
+    This ordering matches `tracker._resolve_one_signal`'s live mirror.
     """
     risk = abs(trade.entry - trade.stop_loss)
     is_long = trade.direction == "LONG"
+    be_armed = False
+    stop = trade.stop_loss
+
     for i in range(start_idx, len(candles)):
         c = candles[i]
         high, low = c["high"], c["low"]
-        sl_hit = (low <= trade.stop_loss) if is_long else (high >= trade.stop_loss)
+
+        sl_hit = (low <= stop) if is_long else (high >= stop)
         tp_hit = (high >= trade.take_profit) if is_long else (low <= trade.take_profit)
 
-        if sl_hit and tp_hit:
-            outcome, price = "SL", trade.stop_loss
-        elif sl_hit:
-            outcome, price = "SL", trade.stop_loss
+        outcome: str | None = None
+        price: float | None = None
+        if sl_hit:
+            outcome = "BE" if be_armed and stop == trade.entry else "SL"
+            price = stop
         elif tp_hit:
             outcome, price = "TP", trade.take_profit
-        else:
-            continue
+        elif max_holding_bars is not None and (i - trade.entry_idx) >= max_holding_bars:
+            outcome, price = "TIME", float(c["close"])
 
-        r = ((price - trade.entry) / risk) if is_long else ((trade.entry - price) / risk)
-        return dataclasses.replace(
-            trade,
-            exit_idx=i,
-            exit_time_ms=c.get("close_time"),
-            exit_price=price,
-            outcome=outcome,
-            r_multiple=r,
-        )
+        if outcome is not None:
+            r = ((price - trade.entry) / risk) if is_long else ((trade.entry - price) / risk)
+            return dataclasses.replace(
+                trade,
+                exit_idx=i,
+                exit_time_ms=c.get("close_time"),
+                exit_price=price,
+                outcome=outcome,  # type: ignore[arg-type]
+                r_multiple=r,
+            )
+
+        # No exit this bar — check the breakeven arming trigger (effective
+        # from the NEXT bar onward).
+        if breakeven_at_r is not None and not be_armed:
+            trigger = (
+                trade.entry + breakeven_at_r * risk
+                if is_long
+                else trade.entry - breakeven_at_r * risk
+            )
+            touched = (high >= trigger) if is_long else (low <= trigger)
+            if touched:
+                be_armed = True
+                stop = trade.entry
 
     return trade  # still open at end of history
 
@@ -198,10 +228,21 @@ async def run_walk_forward(
     open_trade: Trade | None = None
     n_setups = 0
 
+    # Regime annotation — computed ONCE per symbol from filtered (forward-
+    # only) HMM probabilities, so the per-bar loop just indexes into it.
+    regime_series: list[float | None] | None = None
+    if p.regime_filter is not None:
+        from data_fetchers.regime import annotate_regime
+        regime_series = annotate_regime(candles)
+
     for idx in range(_WARMUP_BARS, len(candles), _STEP_BARS):
         # If a trade is open, advance it bar-by-bar (don't re-enter).
         if open_trade is not None:
-            resolved = _resolve_forward(open_trade, candles, idx)
+            resolved = _resolve_forward(
+                open_trade, candles, idx,
+                breakeven_at_r=p.breakeven_at_r,
+                max_holding_bars=p.max_holding_bars,
+            )
             if resolved.outcome != "OPEN":
                 trades.append(resolved)
                 open_trade = None
@@ -212,6 +253,8 @@ async def run_walk_forward(
         indicators = compute_indicators(window, lookbacks=lookbacks)
         if indicators.get("error"):
             continue
+        if regime_series is not None:
+            indicators["regime_p_high"] = regime_series[idx]
 
         # Wrap into the per-interval dict shape the rule engine expects.
         decision = generate_rule_decision(
@@ -237,7 +280,7 @@ async def run_walk_forward(
             )
 
     # Any trade still open at the end is dropped from stats (no exit price).
-    closed = [t for t in trades if t.outcome in ("TP", "SL")]
+    closed = [t for t in trades if t.outcome in ("TP", "SL", "BE", "TIME")]
     r_returns = [t.r_multiple for t in closed]
 
     summary = summarize(

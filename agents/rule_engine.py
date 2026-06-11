@@ -71,6 +71,21 @@ class TermParams:
     # the multiplier is conservative (over-sizes slightly), which is the safer
     # error direction in vol-targeting context.
     periods_per_year: int = 35040
+    # --- Exit engineering (v3.0, sweep-validated per market/term) ----------
+    # breakeven_at_r: when favorable excursion reaches +X·R, the stop moves to
+    # entry (arms on the NEXT bar — intrabar path is unknowable, so same-bar
+    # arming would be optimistic). Davey's 567k-backtest study ranks
+    # breakeven among the best simple exit families.
+    breakeven_at_r: float | None = None
+    # max_holding_bars: time barrier (López de Prado's triple-barrier third
+    # leg) — close at bar-close once the trade has been open N signal-TF
+    # bars without hitting TP or SL. Caps dead capital + thesis decay.
+    max_holding_bars: int | None = None
+    # --- Regime filter (Hamilton 1989 2-state Gaussian HMM) ----------------
+    # "low_vol"  → only enter when P(high-vol regime) < 0.5
+    # "high_vol" → only enter when P(high-vol regime) ≥ 0.5
+    # None       → no regime gating. Validated per market/term via sweep.
+    regime_filter: Literal["low_vol", "high_vol"] | None = None
 
 
 # Vol-targeting starting defaults (Carver 2015 §11; AQR/Harvey 2018).
@@ -355,6 +370,13 @@ def _build_setup(
         "position_notional_usd": notional_usd,
         "risk_usd": max_risk_usd,
         "reward_risk_ratio": rr,
+        # Exit policy — consumed by tracker resolution (theoretical signals)
+        # and the trailing job (real trades). None values = plain TP/SL.
+        "exit_policy": {
+            "breakeven_at_r": p.breakeven_at_r,
+            "max_holding_bars": p.max_holding_bars,
+            "bar_interval": p.signal_interval,
+        },
         "valid_until_seconds": SETUP_VALID_SECS,
         "vision_confirms_quant": None,
         "chart_observations": [
@@ -641,6 +663,13 @@ def _evaluate_gates(
     if market == MarketType.BIST:
         if in_tcmb_blackout():
             return False, 0.0, "TCMB PPK blackout window (13:00-17:00 TR) active"
+        # Earnings blackout (v3.0) — PEAD vol veto, same ±1d window as US.
+        # BIST is now the strongest validated edge; an earnings gap through a
+        # mean-reversion stop is exactly the tail this trims.
+        if is_in_earnings_blackout(next_earnings_iso):
+            return False, 0.0, (
+                f"earnings blackout active (next earnings: {next_earnings_iso})"
+            )
         # Huge daily USDTRY move flag (informational; soft size cut).
         usdtry = macro_lite.get("usdtry") or {}
         pct = usdtry.get("pct_change_1d")
@@ -752,6 +781,24 @@ def generate_rule_decision(
             symbol, market, term, p,
             f"signal interval {p.signal_interval} has insufficient indicator data",
         )
+
+    # ---- HMM regime gate (Hamilton 1989) ---------------------------------
+    # regime_p_high = FILTERED P(high-vol state) injected by the caller
+    # (orchestrator per cycle / walk-forward per bar). Missing value ⇒ gate
+    # skipped (fail-open) so a regime-fit hiccup never silences the engine.
+    if p.regime_filter is not None:
+        p_high = primary.get("regime_p_high")
+        if p_high is not None:
+            if p.regime_filter == "low_vol" and p_high >= 0.5:
+                return _empty_wait(
+                    symbol, market, term, p,
+                    f"regime gate: P(high-vol)={p_high:.2f} ≥ 0.5 (needs low-vol)",
+                )
+            if p.regime_filter == "high_vol" and p_high < 0.5:
+                return _empty_wait(
+                    symbol, market, term, p,
+                    f"regime gate: P(high-vol)={p_high:.2f} < 0.5 (needs high-vol)",
+                )
 
     if effective_bias == "MR":
         decision = _evaluate_mr(

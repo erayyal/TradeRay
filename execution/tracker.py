@@ -433,11 +433,28 @@ async def _resolve_signal_group(
     return resolved, still_open
 
 
-async def _resolve_one_signal(signal: Signal, candles: list[dict]) -> bool:
-    """Walk candles after signal creation, find first TP / SL touch.
+# Signal-TF bar duration (ms) — drives the time-barrier deadline. The replay
+# candles may be FINER than the signal TF (15m/1h replay of a 4h plan), so the
+# time exit triggers on the first replay bar that closes past the deadline.
+_BAR_MS: dict[str, int] = {
+    "5m": 5 * 60_000,
+    "15m": 15 * 60_000,
+    "1h": 3_600_000,
+    "4h": 4 * 3_600_000,
+    "1d": 24 * 3_600_000,
+}
 
-    Returns True if a resolution was persisted, False if the signal is
-    still open (no touch yet).
+
+async def _resolve_one_signal(signal: Signal, candles: list[dict]) -> bool:
+    """Walk candles after signal creation, find the first exit touch.
+
+    Mirrors `backtest.walk_forward._resolve_forward` exactly:
+      1. stop (original SL, or entry once breakeven armed) → SL / BE
+      2. take-profit → TP
+      3. time barrier (exit_policy.max_holding_bars × signal-TF bar) → TIME
+      4. breakeven trigger arms the stop for SUBSEQUENT bars only.
+
+    Returns True if a resolution was persisted, False if still open.
     """
     entry, tp, sl = signal.entry_price, signal.take_profit, signal.stop_loss
     if entry is None or tp is None or sl is None:
@@ -448,28 +465,44 @@ async def _resolve_one_signal(signal: Signal, candles: list[dict]) -> bool:
     if not relevant:
         return False
 
+    policy = (signal.raw_payload or {}).get("exit_policy") or {}
+    be_at_r = policy.get("breakeven_at_r")
+    max_bars = policy.get("max_holding_bars")
+    bar_ms = _BAR_MS.get(policy.get("bar_interval") or "", 0)
+    deadline_ms = (
+        sig_ms + int(max_bars) * bar_ms
+        if max_bars and bar_ms else None
+    )
+
     is_long = signal.action == SignalAction.LONG
+    risk = abs(entry - sl)
+    be_armed = False
+    stop = sl
     outcome: str | None = None
     exit_price: float | None = None
     exit_time_ms: int | None = None
 
     for c in relevant:
-        if is_long:
-            # Conservative: if both TP and SL hit in the same candle, assume SL
-            # touched first (worse outcome). This matches risk-management bias.
-            if c["low"] <= sl:
-                outcome, exit_price, exit_time_ms = "SL", sl, c["close_time"]
-                break
-            if c["high"] >= tp:
-                outcome, exit_price, exit_time_ms = "TP", tp, c["close_time"]
-                break
-        else:
-            if c["high"] >= sl:
-                outcome, exit_price, exit_time_ms = "SL", sl, c["close_time"]
-                break
-            if c["low"] <= tp:
-                outcome, exit_price, exit_time_ms = "TP", tp, c["close_time"]
-                break
+        high, low = c["high"], c["low"]
+        sl_hit = (low <= stop) if is_long else (high >= stop)
+        tp_hit = (high >= tp) if is_long else (low <= tp)
+
+        if sl_hit:
+            outcome = "BE" if be_armed and stop == entry else "SL"
+            exit_price, exit_time_ms = stop, c["close_time"]
+            break
+        if tp_hit:
+            outcome, exit_price, exit_time_ms = "TP", tp, c["close_time"]
+            break
+        if deadline_ms is not None and c["close_time"] >= deadline_ms:
+            outcome, exit_price, exit_time_ms = "TIME", float(c["close"]), c["close_time"]
+            break
+
+        if be_at_r is not None and not be_armed and risk > 0:
+            trigger = entry + be_at_r * risk if is_long else entry - be_at_r * risk
+            if (high >= trigger) if is_long else (low <= trigger):
+                be_armed = True
+                stop = entry
 
     if outcome is None:
         return False
@@ -485,7 +518,7 @@ async def _resolve_one_signal(signal: Signal, candles: list[dict]) -> bool:
     )
 
     resolution = {
-        "status": "RESOLVED_TP" if outcome == "TP" else "RESOLVED_SL",
+        "status": f"RESOLVED_{outcome}",
         "outcome": outcome,
         "exit_price": exit_price,
         "resolved_at_ms": exit_time_ms,
@@ -776,10 +809,32 @@ async def _trail_one_trade(trade: Trade, signal: Signal) -> str | None:
         # Not even one bar closed since entry — give the trade a chance.
         return None
 
+    # Breakeven arming (exit_policy from the originating signal): once the
+    # favorable excursion since entry reaches +X·R of the ORIGINAL plan,
+    # the floor for the stop becomes the entry price — combined with the
+    # chandelier level via max()/min() so whichever protects more wins.
+    be_floor: float | None = None
+    policy = (signal.raw_payload or {}).get("exit_policy") or {}
+    be_at_r = policy.get("breakeven_at_r")
+    orig_sl = signal.stop_loss
+    if be_at_r and orig_sl is not None and trade.entry_price is not None:
+        risk0 = abs(trade.entry_price - orig_sl)
+        if risk0 > 0:
+            if trade.side == "LONG":
+                trigger = trade.entry_price + float(be_at_r) * risk0
+                if max(c["high"] for c in post_entry) >= trigger:
+                    be_floor = trade.entry_price
+            else:
+                trigger = trade.entry_price - float(be_at_r) * risk0
+                if min(c["low"] for c in post_entry) <= trigger:
+                    be_floor = trade.entry_price
+
     is_long = trade.side == "LONG"
     if is_long:
         anchor = max(c["high"] for c in post_entry)
         chandelier_sl = anchor - _CHANDELIER_ATR_MULT * atr
+        if be_floor is not None:
+            chandelier_sl = max(chandelier_sl, be_floor)
         # Don't trail beyond the current price — would be an instant-stop.
         last_close = float(candles[-1]["close"])
         chandelier_sl = min(chandelier_sl, last_close * 0.999)
@@ -789,6 +844,8 @@ async def _trail_one_trade(trade: Trade, signal: Signal) -> str | None:
     else:
         anchor = min(c["low"] for c in post_entry)
         chandelier_sl = anchor + _CHANDELIER_ATR_MULT * atr
+        if be_floor is not None:
+            chandelier_sl = min(chandelier_sl, be_floor)
         last_close = float(candles[-1]["close"])
         chandelier_sl = max(chandelier_sl, last_close * 1.001)
         if chandelier_sl >= trade.stop_loss:
