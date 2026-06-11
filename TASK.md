@@ -6,7 +6,37 @@
 
 ---
 
-## 0. Durum (2026-06-11 akşam — v3.0)
+## 0a. SON DURUM (2026-06-11 gece — v3.0b CANLI) + 1 hafta gözlem planı
+
+**Exit-grid sweep sonuçları uygulandı ve deploy edildi** (commit `7e6d016`,
+82/82 test, 5 container healthy):
+
+| Hücre | Exit politikası | Backtest |
+|---|---|---|
+| CRYPTO 4h (HYB) | hold=40 bar | DSR 0.785, +74R |
+| CRYPTO 1d (TF) | be=1.5R + hold=40 | DSR 0.601, +51R |
+| BIST 1d (MR) | be=1.0R | DSR 0.991, avgR +0.62 |
+| US 1d (MR) | exit yok | gözlem (DSR 0.019) |
+
+HMM rejim gate'i HER YERDE KAPALI (sweep'te DSR düşürdü); `regime_p_high`
+audit'te birikmeye devam ediyor. FNG enstrümantasyon modunda.
+
+**Kullanıcı kararı (2026-06-11):** sistem bu haliyle canlıda kalacak,
+~1 hafta log/veri birikecek, sonra birlikte değerlendirilecek.
+
+**1 hafta sonraki değerlendirme (≈2026-06-18) checklist'i:**
+1. §3'teki sağlık + sinyal sorguları (aşağıda) — artık BE/TIME outcome'ları
+   da var (`raw_payload->'resolution'->>'outcome'` ∈ TP/SL/BE/TIME).
+2. UI "📈 Performans" sekmesi: market×term kırılımında hangi hücre canlıda
+   backtest'le uyumlu? Özellikle BIST 1d MR (en güçlü iddia).
+3. US MID_TERM: sinyal var mı, totR pozitif mi? Negatifse US'i evrenden
+   çıkarmayı değerlendir (enabled=false).
+4. AUTO_BOT karar tarihi: en erken 2026-06-24 (§11.5: 2 hafta pozitif
+   SIGNAL-only + DSR>0.5 ✓ + cost budget ✓ [LLM $0]).
+5. Audit'te `regime_p_high` × outcome korelasyonuna bak — rejim gate'i
+   canlı veriyle yeniden değerlendir.
+
+## 0b. Durum (2026-06-11 akşam — v3.0)
 
 v3.0 eklentileri (hepsi prod'da, 82/82 test):
 - **Exit mühendisliği**: `TermParams.breakeven_at_r` / `max_holding_bars`;
