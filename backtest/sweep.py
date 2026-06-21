@@ -49,6 +49,12 @@ DEFAULT_GRID: dict[str, list] = {
     "rel_volume_min": [0.8, 1.0, 1.2],
 }
 
+# Meta-labeling axes (Phase B/E). Off by default to keep the legacy 432-combo
+# entry grid intact; enabled via --conf-grid / --regime-grid. The confidence
+# floor and regime gate are the live-data-validated secondary-model features.
+DEFAULT_CONF_GRID: list[int] = [0, 60, 70, 80]
+DEFAULT_REGIME_GRID: list[str | None] = [None, "low_vol", "high_vol"]
+
 # MR-bias grid needs RSI thresholds too; keep the same structural axes but
 # the RSI extremes are part of what defines an MR strategy on daily bars.
 MR_RSI_GRID: list[tuple[float, float]] = [
@@ -73,8 +79,21 @@ class ComboResult:
     per_symbol: dict[str, dict[str, Any]]
 
 
-def _build_combos(base: TermParams, biases: Sequence[str]) -> list[TermParams]:
-    """Expand the grid into concrete TermParams candidates."""
+def _build_combos(
+    base: TermParams,
+    biases: Sequence[str],
+    *,
+    conf_grid: Sequence[int] | None = None,
+    regime_grid: Sequence[str | None] | None = None,
+) -> list[TermParams]:
+    """Expand the grid into concrete TermParams candidates.
+
+    conf_grid / regime_grid (Phase B/E) add the meta-labeling axes; when None
+    they collapse to a single pass-through value so the legacy entry grid
+    keeps its 432-combo shape.
+    """
+    conf_grid = conf_grid or [base.min_confidence]
+    regime_grid = regime_grid or [base.regime_filter]
     combos: list[TermParams] = []
     axes = list(itertools.product(
         DEFAULT_GRID["atr_sl_mult"],
@@ -89,16 +108,20 @@ def _build_combos(base: TermParams, biases: Sequence[str]) -> list[TermParams]:
             rsi_axes = [(base.rsi_long_max, base.rsi_short_min)]
         for (atr_m, rr, adx_min, rvol) in axes:
             for (rsi_lo, rsi_hi) in rsi_axes:
-                combos.append(dataclasses.replace(
-                    base,
-                    bias=bias,  # type: ignore[arg-type]
-                    atr_sl_mult=atr_m,
-                    rr_target=rr,
-                    adx_min_for_trend=adx_min,
-                    rel_volume_min=rvol,
-                    rsi_long_max=rsi_lo,
-                    rsi_short_min=rsi_hi,
-                ))
+                for conf in conf_grid:
+                    for regime in regime_grid:
+                        combos.append(dataclasses.replace(
+                            base,
+                            bias=bias,  # type: ignore[arg-type]
+                            atr_sl_mult=atr_m,
+                            rr_target=rr,
+                            adx_min_for_trend=adx_min,
+                            rel_volume_min=rvol,
+                            rsi_long_max=rsi_lo,
+                            rsi_short_min=rsi_hi,
+                            min_confidence=conf,
+                            regime_filter=regime,  # type: ignore[arg-type]
+                        ))
     return combos
 
 
@@ -114,6 +137,7 @@ def _combo_label(p: TermParams) -> dict[str, Any]:
         "breakeven_at_r": p.breakeven_at_r,
         "max_holding_bars": p.max_holding_bars,
         "regime_filter": p.regime_filter,
+        "min_confidence": p.min_confidence,
     }
 
 
@@ -184,10 +208,14 @@ async def run_sweep(
     n_bars: int = 1500,   # Binance futures klines hard cap per request
     combos: list[TermParams] | None = None,
     n_trials_floor: int = 0,
+    conf_grid: Sequence[int] | None = None,
+    regime_grid: Sequence[str | None] | None = None,
 ) -> list[ComboResult]:
     base = params_for(market, term)
     if combos is None:
-        combos = _build_combos(base, biases)
+        combos = _build_combos(
+            base, biases, conf_grid=conf_grid, regime_grid=regime_grid,
+        )
     # The DSR penalty must reflect EVERY variant tried across the campaign,
     # not just this run — `n_trials_floor` lets exit sweeps inherit the 432
     # entry-grid trials already spent on the same data.
@@ -271,11 +299,12 @@ def _print_report(results: list[ComboResult], top: int) -> None:
         c = r.combo
         exit_suffix = ""
         if c.get("breakeven_at_r") is not None or c.get("max_holding_bars") is not None \
-                or c.get("regime_filter") is not None:
+                or c.get("regime_filter") is not None or c.get("min_confidence"):
             exit_suffix = (
                 f"  be={c.get('breakeven_at_r') or '-'} "
                 f"hold={c.get('max_holding_bars') or '-'} "
-                f"reg={c.get('regime_filter') or '-'}"
+                f"reg={c.get('regime_filter') or '-'} "
+                f"conf>={c.get('min_confidence') or 0}"
             )
         print(
             f"{rank:>4} {c['bias']:>4} {c['atr_sl_mult']:>4} {c['rr_target']:>4} "
@@ -316,6 +345,11 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="regime_filter values")
     p.add_argument("--n-trials-floor", type=int, default=0,
                    help="minimum n_trials for DSR (count prior sweeps on same data)")
+    # Meta-labeling axes for the ENTRY grid (Phase B/E).
+    p.add_argument("--conf-grid", default=None,
+                   help="confidence floor values, e.g. 0,60,70,80 (entry grid)")
+    p.add_argument("--regime-grid-entry", default=None,
+                   help="regime filter values for entry grid, e.g. none,low_vol,high_vol")
     return p
 
 
@@ -331,6 +365,13 @@ async def _amain(argv: list[str]) -> int:
             time_grid=_parse_int_grid(args.time_grid),
             regime_grid=_parse_regime_grid(args.regime_grid),
         )
+    conf_grid = _parse_int_grid(args.conf_grid) if args.conf_grid else None
+    # int grid parser maps 0→None; confidence 0 means "off", so coerce back.
+    if conf_grid is not None:
+        conf_grid = [0 if v is None else v for v in conf_grid]
+    regime_grid_entry = (
+        _parse_regime_grid(args.regime_grid_entry) if args.regime_grid_entry else None
+    )
     try:
         results = await run_sweep(
             symbols=[s.strip().upper() for s in args.symbols.split(",") if s.strip()],
@@ -342,6 +383,8 @@ async def _amain(argv: list[str]) -> int:
             n_bars=args.n_bars,
             combos=combos,
             n_trials_floor=args.n_trials_floor,
+            conf_grid=conf_grid,
+            regime_grid=regime_grid_entry,
         )
     finally:
         try:

@@ -86,6 +86,12 @@ class TermParams:
     # "high_vol" → only enter when P(high-vol regime) ≥ 0.5
     # None       → no regime gating. Validated per market/term via sweep.
     regime_filter: Literal["low_vol", "high_vol"] | None = None
+    # --- Confidence floor (meta-labeling, López de Prado 2018) -------------
+    # The rule engine's own confidence score is the secondary-model feature:
+    # live data (2026-06-19) showed conf≥80 SCALP +300 USD vs conf<75 −810.
+    # A non-WAIT setup whose confidence < min_confidence is downgraded to
+    # WAIT — trading the primary model's recall for precision. 0 = off.
+    min_confidence: int = 0
 
 
 # Vol-targeting starting defaults (Carver 2015 §11; AQR/Harvey 2018).
@@ -824,6 +830,17 @@ def generate_rule_decision(
         decision = _evaluate_hyb(
             symbol=symbol, market=market, term=term, p=p, indicators=indicators,
         )
+
+    # ---- Meta-labeling confidence floor (López de Prado 2018) -------------
+    # Secondary-model gate: drop low-conviction setups entirely. Applied
+    # AFTER the bias evaluator (which assigns confidence) and BEFORE sizing.
+    if decision["decision"] in ("LONG", "SHORT") and p.min_confidence > 0:
+        conf = decision.get("confidence_level") or 0
+        if conf < p.min_confidence:
+            return _empty_wait(
+                symbol, market, term, p,
+                f"confidence floor: {conf} < min {p.min_confidence} (meta-label veto)",
+            )
 
     # ---- Apply pre-gate size multiplier + vol-targeting ------------------
     if decision["decision"] in ("LONG", "SHORT"):

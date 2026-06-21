@@ -6,12 +6,16 @@ patch the calendar blackout helpers where date-sensitive behaviour matters.
 """
 from __future__ import annotations
 
+import dataclasses
+
 from agents.rule_engine import (
     BIST_PARAMS,
     CRYPTO_PARAMS,
     EQUITY_US_PARAMS,
     _evaluate_gates,
     _vol_targeted_multiplier,
+    generate_rule_decision,
+    params_for,
 )
 from models import MarketType, Term
 
@@ -241,3 +245,56 @@ def test_bist_risk_pct_lower_than_crypto():
         bist = BIST_PARAMS[term].risk_pct
         crypto = CRYPTO_PARAMS[term].risk_pct
         assert bist <= crypto
+
+
+# ---------------------------------------------------------------------------
+# Meta-labeling confidence floor (Phase B — López de Prado 2018)
+# ---------------------------------------------------------------------------
+
+def _scalp_long_indicators() -> dict[str, dict]:
+    """Synthetic indicator bundle that fires a CRYPTO SCALP MR LONG."""
+    primary = {
+        "rsi_short": 8.0,        # RSI(2) deep-oversold (≤15 long trigger)
+        "rsi": 28.0,
+        "bb_position": 0.05,     # near lower band (≤0.2)
+        "atr": 100.0,
+        "atr_pct": 0.02,
+        "last_close": 50_000.0,
+        "rel_volume": 1.5,       # ≥ rel_volume_min
+        "adx": 22.0,
+        "adx_regime": "trending",
+    }
+    confirm = {"above_ema_slow": True}   # 1h trend filter agrees with LONG
+    return {"15m": primary, "1h": confirm}
+
+
+def test_scalp_setup_fires_without_confidence_floor():
+    decision = generate_rule_decision(
+        symbol="BTCUSDT", market=MarketType.CRYPTO, term=Term.SCALP,
+        primary_interval="15m", indicators=_scalp_long_indicators(),
+    )
+    assert decision["decision"] == "LONG"
+    assert decision["confidence_level"] >= 60
+
+
+def test_confidence_floor_vetoes_low_conviction():
+    base = params_for(MarketType.CRYPTO, Term.SCALP)
+    high_floor = dataclasses.replace(base, min_confidence=99)
+    decision = generate_rule_decision(
+        symbol="BTCUSDT", market=MarketType.CRYPTO, term=Term.SCALP,
+        primary_interval="15m", indicators=_scalp_long_indicators(),
+        params_override=high_floor,
+    )
+    assert decision["decision"] == "WAIT"
+    assert "confidence floor" in decision["justification"]
+
+
+def test_confidence_floor_passes_when_met():
+    base = params_for(MarketType.CRYPTO, Term.SCALP)
+    low_floor = dataclasses.replace(base, min_confidence=60)
+    decision = generate_rule_decision(
+        symbol="BTCUSDT", market=MarketType.CRYPTO, term=Term.SCALP,
+        primary_interval="15m", indicators=_scalp_long_indicators(),
+        params_override=low_floor,
+    )
+    assert decision["decision"] == "LONG"

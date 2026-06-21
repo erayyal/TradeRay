@@ -103,7 +103,29 @@ NASDAQ_POOL: list[str] = [
     "SBUX", "MU",
 ]
 
+# CRYPTO quality pool (Phase A, 2026-06-19 live-data analysis).
+#
+# The screener used to rank ALL USDT-M perps by 24h quote volume, which on
+# volatile days pulls freshly-listed / low-cap / meme coins (HYPE, SPCX, ZEC,
+# H) into the top-5 exactly when their volume spikes on a pump — the worst
+# possible moment for mean-reversion scalping. Restricting screener candidates
+# to this curated set of established, deep-liquidity, multi-year-listed perps
+# encodes "liquid + not-junk + survivable gap risk" without per-cycle
+# onboardDate / market-cap API calls. The screener still rotates to whatever
+# is most active AMONG these names, preserving the opportunity-hunting intent.
+#
+# Selection criteria: top USDT-M perps by sustained turnover & open interest
+# that have traded >1y, excluding stablecoins and obvious meme/microcap names.
+CRYPTO_POOL: list[str] = [
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
+    "ADAUSDT", "AVAXUSDT", "LINKUSDT", "DOGEUSDT", "LTCUSDT",
+    "DOTUSDT", "TRXUSDT", "MATICUSDT", "BCHUSDT", "NEARUSDT",
+    "ATOMUSDT", "UNIUSDT", "FILUSDT", "APTUSDT", "ARBUSDT",
+    "OPUSDT", "INJUSDT", "AAVEUSDT", "ETCUSDT", "XLMUSDT",
+]
+
 _POOLS: dict[MarketType, list[str]] = {
+    MarketType.CRYPTO: CRYPTO_POOL,
     MarketType.BIST: BIST_POOL,
     MarketType.SP500: SP500_POOL,
     MarketType.NASDAQ: NASDAQ_POOL,
@@ -196,9 +218,15 @@ class _BinanceAdapter:
         ]
 
     async def top_by_volume(
-        self, limit: int, *, quote: str = "USDT", min_quote_volume: float = 1e7
+        self, limit: int, *, quote: str = "USDT", min_quote_volume: float = 1e7,
+        allowed: set[str] | None = None,
     ) -> list[str]:
-        """24h ticker stats → top USDT perpetuals by quote volume."""
+        """24h ticker stats → top USDT perpetuals by quote volume.
+
+        `allowed`, when given, restricts candidates to a curated quality pool
+        (Phase A) — the screener then rotates only among established names,
+        never picking a freshly-pumped microcap that briefly tops raw volume.
+        """
         c = await self.read_client()
         tickers = await c.futures_ticker()
         usdt = []
@@ -208,6 +236,8 @@ class _BinanceAdapter:
             if not sym.endswith(quote):
                 continue
             if "_" in sym:  # filters dated futures like BTCUSDT_240329
+                continue
+            if allowed is not None and sym not in allowed:
                 continue
             try:
                 qv = float(t.get("quoteVolume", 0) or 0)
@@ -557,11 +587,17 @@ class MarketFetcher:
         """
         try:
             if market == MarketType.CRYPTO:
-                picks = await self._binance.top_by_volume(limit=limit)
+                # Phase A: rank by 24h volume but ONLY within the curated
+                # quality pool — keeps the screen on liquid, established perps
+                # and excludes meme/microcap pumps.
+                picks = await self._binance.top_by_volume(
+                    limit=limit, allowed=set(CRYPTO_POOL),
+                )
                 if not picks:
-                    raise RuntimeError("binance ticker returned no USDT pairs")
+                    raise RuntimeError("binance ticker returned no pool USDT pairs")
                 log.info(
-                    "screener.crypto", picks=picks, by="24h_quote_volume"
+                    "screener.crypto", picks=picks,
+                    by="24h_quote_volume", pool="quality",
                 )
                 return picks
 
@@ -594,6 +630,7 @@ __all__ = [
     "INDICATOR_LOOKBACKS",
     "intervals_for",
     "lookbacks_for",
+    "CRYPTO_POOL",
     "BIST_POOL",
     "SP500_POOL",
     "NASDAQ_POOL",
