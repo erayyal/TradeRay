@@ -169,13 +169,15 @@ def _filter_window(
 async def _fetch_history(
     symbol: str, market: MarketType, interval: str, *, n_bars: int,
 ) -> list[dict]:
-    """Pull `n_bars` candles. Binance caps at 1500 per call — chunk if needed.
+    """Pull `n_bars` candles.
 
-    The market_fetcher already paginates internally for Binance; for
-    yfinance it returns whatever the period setting supports (typically up to
-    2 years of daily data). For backtest we want as much history as we can
-    get — pass the upper bound and let the fetcher cap.
+    Crypto + n_bars>1500 uses the paginating deep-fetch (endTime chunking) so
+    low-TF walk-forwards (15m SCALP over months) have enough history. yfinance
+    returns whatever the period setting supports (~2y daily); for equities we
+    pass the upper bound and let the fetcher cap.
     """
+    if market == MarketType.CRYPTO and n_bars > 1500:
+        return await fetcher._binance.fetch_deep(symbol, interval, n_bars)
     return await fetcher.fetch_ohlcv(symbol, market, interval, limit=n_bars)
 
 

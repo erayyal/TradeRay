@@ -198,12 +198,18 @@ class _BinanceAdapter:
             await self._read_client.close_connection()
             self._read_client = None
 
-    async def fetch(self, symbol: str, interval: str, limit: int = 300) -> list[dict]:
+    async def fetch(
+        self, symbol: str, interval: str, limit: int = 300,
+        *, end_time: int | None = None,
+    ) -> list[dict]:
         bn = _BINANCE_INTERVAL.get(interval)
         if bn is None:
             raise ValueError(f"binance: unsupported interval {interval!r}")
         c = await self.read_client()
-        raw = await c.futures_klines(symbol=symbol, interval=bn, limit=limit)
+        kwargs: dict = {"symbol": symbol, "interval": bn, "limit": min(limit, 1500)}
+        if end_time is not None:
+            kwargs["endTime"] = end_time
+        raw = await c.futures_klines(**kwargs)
         return [
             {
                 "open_time":  int(r[0]),
@@ -216,6 +222,32 @@ class _BinanceAdapter:
             }
             for r in raw
         ]
+
+    async def fetch_deep(self, symbol: str, interval: str, n_bars: int) -> list[dict]:
+        """Paginate backwards via endTime to assemble >1500 bars.
+
+        Binance caps futures_klines at 1500 rows/call; deep walk-forward
+        (e.g. 12 months of 15m = ~35k bars) needs chunking. We page from now
+        backwards, dedup on open_time, and return ascending by time.
+        """
+        if n_bars <= 1500:
+            return await self.fetch(symbol, interval, limit=n_bars)
+        out: dict[int, dict] = {}
+        end_time: int | None = None
+        guard = 0
+        while len(out) < n_bars and guard < 200:
+            guard += 1
+            chunk = await self.fetch(symbol, interval, limit=1500, end_time=end_time)
+            if not chunk:
+                break
+            for bar in chunk:
+                out[bar["open_time"]] = bar
+            oldest = min(b["open_time"] for b in chunk)
+            if end_time is not None and oldest >= end_time:
+                break  # no progress — exhausted history
+            end_time = oldest - 1
+        rows = sorted(out.values(), key=lambda b: b["open_time"])
+        return rows[-n_bars:]
 
     async def top_by_volume(
         self, limit: int, *, quote: str = "USDT", min_quote_volume: float = 1e7,
