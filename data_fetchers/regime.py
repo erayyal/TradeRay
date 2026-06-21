@@ -28,23 +28,22 @@ log = get_logger(__name__)
 # Minimum observations before the first fit — below this the EM estimates
 # are noise. ~6 months of daily bars / ~5 weeks of 4h bars.
 _MIN_OBS: int = 120
-# Refit cadence + EM iteration count tuned for tractable deep-history
-# annotation. A 2-state vol regime's parameters drift slowly, so refitting
-# every 50 bars (vs 20) loses no meaningful resolution while cutting fit count
-# 2.5×; the EM converges well within 25 iterations for 2 Gaussians. Between
-# refits the forward filter still advances every bar, so per-bar probabilities
-# stay current. Net ≈5× faster than the original 20/40 settings.
-_REFIT_EVERY: int = 50
-_EM_ITERS: int = 25
+# Annotation-cost knobs. The bottleneck is Baum-Welch's forward-backward,
+# whose inner recursion is a Python loop with per-element numpy calls — so
+# total annotation cost ≈ (#refits) × (fit_window × EM_iters). What the regime
+# model actually needs to estimate is just two Gaussian (mean, var) pairs for
+# calm vs turbulent — parameters that drift VERY slowly. So we can refit
+# infrequently and on a modest window without losing fidelity, because the
+# per-bar forward FILTER (cheap, incremental) keeps state probabilities
+# current between refits.
+#   refit_every 150 : ~1.5 days of 15m / 7 months of daily between param refits
+#   EM_iters    20  : 2-Gaussian EM converges well within this
+#   fit_window 1200 : 12.5 days of 15m, ample to separate two vol states
+# Net ~30× faster than the original 20-refit / 40-iter / expanding-window form.
+_REFIT_EVERY: int = 150
+_EM_ITERS: int = 20
 _VAR_FLOOR: float = 1e-12
-# Cap the trailing window each EM fit sees. The Baum-Welch forward-backward
-# is O(window × iters) with Python-level loops, so an EXPANDING window over a
-# deep 15m history (35k bars) makes each refit progressively slower — the
-# annotation cost blows up to O(T²/refit). A bounded trailing window keeps
-# every fit O(_FIT_WINDOW) and is plenty for a 2-state vol regime: ~2000 bars
-# is 20 days of 15m / 11 months of daily, far more than the EM needs to
-# separate calm vs turbulent. Strictly causal (trailing-only).
-_FIT_WINDOW: int = 2000
+_FIT_WINDOW: int = 1200
 
 
 def _gaussian_logpdf(x: np.ndarray, mean: float, var: float) -> np.ndarray:
