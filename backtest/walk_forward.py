@@ -26,7 +26,7 @@ from agents.rule_engine import TermParams, generate_rule_decision, params_for
 from backtest.stats import Summary, summarize
 from core.logger import get_logger
 from data_fetchers.market_fetcher import fetcher, lookbacks_for
-from data_fetchers.technicals import compute_indicators
+from data_fetchers.technicals import compute_indicator_series
 from models import MarketType, Term
 
 log = get_logger(__name__)
@@ -231,9 +231,14 @@ async def run_walk_forward(
     open_trade: Trade | None = None
     n_setups = 0
 
+    # Indicator series — computed ONCE over the full history (talib is causal:
+    # value at bar i uses only data ≤ i), then indexed per bar. This replaces
+    # the old O(T²) per-bar recompute that made deep low-TF sweeps intractable.
+    ind_series = compute_indicator_series(candles, lookbacks=lookbacks)
+
     # Regime annotation — computed ONCE per symbol from filtered (forward-
     # only) HMM probabilities, so the per-bar loop just indexes into it.
-    # Sweeps precompute and pass `regime_series` so 48 combos share one fit.
+    # Sweeps precompute and pass `regime_series` so all combos share one fit.
     if p.regime_filter is not None and regime_series is None:
         from data_fetchers.regime import annotate_regime
         regime_series = annotate_regime(candles)
@@ -254,12 +259,11 @@ async def run_walk_forward(
             else:
                 continue
 
-        window = candles[: idx + 1]
-        indicators = compute_indicators(window, lookbacks=lookbacks)
-        if indicators.get("error"):
+        indicators = ind_series[idx]
+        if indicators is None:
             continue
         if regime_series is not None:
-            indicators["regime_p_high"] = regime_series[idx]
+            indicators = {**indicators, "regime_p_high": regime_series[idx]}
 
         # Wrap into the per-interval dict shape the rule engine expects.
         decision = generate_rule_decision(

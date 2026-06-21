@@ -233,4 +233,100 @@ def compute_indicators(
     }
 
 
-__all__ = ["compute_indicators", "DEFAULT_LOOKBACKS"]
+def compute_indicator_series(
+    candles: Sequence[dict],
+    lookbacks: dict[str, Any] | None = None,
+) -> list[dict[str, Any] | None]:
+    """Full-history indicator computation — ONE talib pass, per-bar dicts out.
+
+    The walk-forward backtest previously called `compute_indicators(window)`
+    for every bar, recomputing every talib series over the whole expanding
+    window each time — O(T²), which made deep low-TF sweeps (15m over months)
+    take days. talib is designed for full-series computation: RSI[t], ATR[t],
+    etc. each use only data ≤ t (strictly causal), so we can compute the
+    entire series once and index per bar — O(T).
+
+    Returns a list aligned 1:1 with `candles`; element `i` is the indicator
+    dict the rule engine reads at bar `i`, or None during the warmup window
+    (where the slowest indicator is still NaN). Field set matches the keys
+    `generate_rule_decision` consumes.
+    """
+    lb = _merge_lookbacks(lookbacks)
+    n = len(candles)
+    min_bars = _min_required_bars(lb)
+    if n < min_bars:
+        return [None] * n
+
+    high = np.array([c["high"] for c in candles], dtype=np.float64)
+    low = np.array([c["low"] for c in candles], dtype=np.float64)
+    close = np.array([c["close"] for c in candles], dtype=np.float64)
+    volume = np.array([c.get("volume", 0) or 0 for c in candles], dtype=np.float64)
+
+    rsi = talib.RSI(close, timeperiod=int(lb["rsi"]))
+    rsi_short = talib.RSI(close, timeperiod=int(lb["rsi_short"]))
+    macd_fast, macd_slow, macd_signal = lb["macd"]
+    _macd, _sig, macd_hist = talib.MACD(
+        close, fastperiod=int(macd_fast), slowperiod=int(macd_slow),
+        signalperiod=int(macd_signal),
+    )
+    bb_upper, _bb_mid, bb_lower = talib.BBANDS(
+        close, timeperiod=int(lb["bbands"]), nbdevup=2, nbdevdn=2
+    )
+    atr = talib.ATR(high, low, close, timeperiod=int(lb["atr"]))
+    adx = talib.ADX(high, low, close, timeperiod=int(lb["adx"]))
+    plus_di = talib.PLUS_DI(high, low, close, timeperiod=int(lb["adx"]))
+    minus_di = talib.MINUS_DI(high, low, close, timeperiod=int(lb["adx"]))
+    ema_fast = talib.EMA(close, timeperiod=int(lb["ema_fast"]))
+    ema_slow_period = min(int(lb["ema_slow"]), max(2, n - 1))
+    ema_slow = talib.EMA(close, timeperiod=ema_slow_period)
+    vol_ma = talib.SMA(volume, timeperiod=int(lb["volume_ma"]))
+
+    def _v(arr: np.ndarray, i: int) -> float | None:
+        x = arr[i]
+        return float(x) if not np.isnan(x) else None
+
+    out: list[dict[str, Any] | None] = [None] * n
+    for i in range(n):
+        atr_i = _v(atr, i)
+        adx_i = _v(adx, i)
+        bbu, bbl = _v(bb_upper, i), _v(bb_lower, i)
+        ema_s = _v(ema_slow, i)
+        last_close = float(close[i])
+
+        bb_pos = None
+        if bbu is not None and bbl is not None and (bbu - bbl) > 0:
+            bb_pos = (last_close - bbl) / (bbu - bbl)
+
+        if adx_i is None:
+            adx_regime = None
+        elif adx_i > 25:
+            adx_regime = "trending"
+        elif adx_i < 20:
+            adx_regime = "ranging"
+        else:
+            adx_regime = "transitional"
+
+        vma = _v(vol_ma, i)
+        rel_vol = (float(volume[i]) / vma) if (vma and volume[i]) else None
+
+        out[i] = {
+            "last_close": last_close,
+            "rsi": _v(rsi, i),
+            "rsi_short": _v(rsi_short, i),
+            "macd_hist": _v(macd_hist, i),
+            "bb_position": bb_pos,
+            "atr": atr_i,
+            "atr_pct": (atr_i / last_close) if atr_i else None,
+            "adx": adx_i,
+            "plus_di": _v(plus_di, i),
+            "minus_di": _v(minus_di, i),
+            "adx_regime": adx_regime,
+            "ema_fast": _v(ema_fast, i),
+            "ema_slow": ema_s,
+            "above_ema_slow": (last_close > ema_s) if ema_s is not None else None,
+            "rel_volume": rel_vol,
+        }
+    return out
+
+
+__all__ = ["compute_indicators", "compute_indicator_series", "DEFAULT_LOOKBACKS"]
