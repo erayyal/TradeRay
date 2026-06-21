@@ -211,6 +211,11 @@ async def run_sweep(
     conf_grid: Sequence[int] | None = None,
     regime_grid: Sequence[str | None] | None = None,
 ) -> list[ComboResult]:
+    # Silence the per-setup INFO log — across a grid it's millions of calls
+    # and the structlog formatting dominates runtime.
+    import agents.rule_engine as _re
+    _re.QUIET_SETUP_LOG = True
+
     base = params_for(market, term)
     if combos is None:
         combos = _build_combos(

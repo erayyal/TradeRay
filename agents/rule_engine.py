@@ -37,6 +37,11 @@ log = get_logger(__name__)
 
 Bias = Literal["TF", "MR", "HYB"]
 
+# Sweep harness sets this True to suppress the per-setup INFO log — at
+# millions of setups across a parameter grid the structlog formatting/IO
+# dominates runtime (and floods the log file). Live cycles leave it False.
+QUIET_SETUP_LOG: bool = False
+
 
 # ---------------------------------------------------------------------------
 # Per-(market, term) parameter matrix.
@@ -859,15 +864,16 @@ def generate_rule_decision(
         decision["sizing_multiplier"] = final_mult
         decision["gate_reason"] = gate_reason
 
-        log.info(
-            "rule_engine.setup",
-            symbol=symbol, market=market.value, term=term.value,
-            bias=effective_bias, direction=decision["decision"],
-            confidence=decision["confidence_level"],
-            rr=round(decision["reward_risk_ratio"], 2),
-            size_mult=round(final_mult, 2),
-        )
+        if not QUIET_SETUP_LOG:
+            log.info(
+                "rule_engine.setup",
+                symbol=symbol, market=market.value, term=term.value,
+                bias=effective_bias, direction=decision["decision"],
+                confidence=decision["confidence_level"],
+                rr=round(decision["reward_risk_ratio"], 2),
+                size_mult=round(final_mult, 2),
+            )
     return decision
 
 
-__all__ = ["generate_rule_decision", "params_for", "TermParams"]
+__all__ = ["generate_rule_decision", "params_for", "TermParams", "QUIET_SETUP_LOG"]
