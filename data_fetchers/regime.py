@@ -28,9 +28,23 @@ log = get_logger(__name__)
 # Minimum observations before the first fit — below this the EM estimates
 # are noise. ~6 months of daily bars / ~5 weeks of 4h bars.
 _MIN_OBS: int = 120
-_REFIT_EVERY: int = 20
-_EM_ITERS: int = 40
+# Refit cadence + EM iteration count tuned for tractable deep-history
+# annotation. A 2-state vol regime's parameters drift slowly, so refitting
+# every 50 bars (vs 20) loses no meaningful resolution while cutting fit count
+# 2.5×; the EM converges well within 25 iterations for 2 Gaussians. Between
+# refits the forward filter still advances every bar, so per-bar probabilities
+# stay current. Net ≈5× faster than the original 20/40 settings.
+_REFIT_EVERY: int = 50
+_EM_ITERS: int = 25
 _VAR_FLOOR: float = 1e-12
+# Cap the trailing window each EM fit sees. The Baum-Welch forward-backward
+# is O(window × iters) with Python-level loops, so an EXPANDING window over a
+# deep 15m history (35k bars) makes each refit progressively slower — the
+# annotation cost blows up to O(T²/refit). A bounded trailing window keeps
+# every fit O(_FIT_WINDOW) and is plenty for a 2-state vol regime: ~2000 bars
+# is 20 days of 15m / 11 months of daily, far more than the EM needs to
+# separate calm vs turbulent. Strictly causal (trailing-only).
+_FIT_WINDOW: int = 2000
 
 
 def _gaussian_logpdf(x: np.ndarray, mean: float, var: float) -> np.ndarray:
@@ -197,8 +211,11 @@ def annotate_regime(
     for t in range(min_obs, len(rets) + 1):
         if params is None or t >= next_refit:
             try:
-                params = fit_hmm(rets[:t])
-                alpha = _forward_filter_full(rets[:t], *params)
+                # Bounded trailing window — keeps each EM fit O(_FIT_WINDOW)
+                # instead of O(t), so deep low-TF histories stay tractable.
+                lo = max(0, t - _FIT_WINDOW)
+                params = fit_hmm(rets[lo:t])
+                alpha = _forward_filter_full(rets[lo:t], *params)
             except Exception as e:   # EM blowup on degenerate data → keep old
                 log.debug("regime.fit_failed", err=str(e), t=t)
                 if params is None:
